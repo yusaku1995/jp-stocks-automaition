@@ -3,16 +3,20 @@ on:
   schedule: [{cron: "15 9 * * 1-5"}]   # 平日18:15 JST
   workflow_dispatch: {}
 
-# Pages の公式方式に必要な権限
 permissions:
-  contents: read
-  pages: write
+  contents: write     # metrics.csv をコミット
+  pages: write        # Pages へ公開
   id-token: write
 
 jobs:
-  build:
+  # ---- 6並列で部分CSVを作る ----
+  shard:
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        chunk: [0, 1, 2, 3, 4, 5]   # ← 6分割（必要なら増減OK）
     steps:
       - uses: actions/checkout@v4
 
@@ -28,34 +32,92 @@ jobs:
       - name: Ensure tickers.txt exists
         run: |
           if [ ! -f tickers.txt ]; then echo "215A" > tickers.txt; fi
-          echo "tickers head:"; head -n 5 tickers.txt || true
+          echo "----- tickers head -----"
+          head -n 10 tickers.txt || true
+          echo "Total:" $(wc -l < tickers.txt || echo 0)
 
-      # 必要なら 1銘柄スモーク（まず通したい時はコメント解除）
-      # - name: Limit to 1 ticker for smoke
-      #   run: echo "MAX_TICKERS=1" >> $GITHUB_ENV
-
-      - name: Run scraper
-        run: python scraper.py
-
-      - name: Prepare site dir (only metrics.csv)
+      - name: Compute OFFSET & LIMIT for this shard
+        id: cut
         run: |
-          mkdir -p site
-          cp metrics.csv site/
+          TOTAL=$(wc -l < tickers.txt)
+          PARTS=6
+          PER=$(( (TOTAL + PARTS - 1) / PARTS ))
+          OFFSET=$(( ${{ matrix.chunk }} * PER ))
+          echo "TOTAL=${TOTAL}, PER=${PER}, OFFSET=${OFFSET}"
+          echo "OFFSET=${OFFSET}" >> $GITHUB_ENV
+          echo "MAX_TICKERS=${PER}" >> $GITHUB_ENV
 
-      # ← Pages 用アーティファクトをアップロード
-      - name: Upload artifact
+      - name: Run scraper for this shard
+        run: |
+          python scraper.py
+          # このジョブの出力を shard毎にファイル名を変えて保存
+          mv metrics.csv metrics_part_${{ matrix.chunk }}.csv
+          head -n 5 metrics_part_${{ matrix.chunk }}.csv || true
+
+      - name: Upload part artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: part-${{ matrix.chunk }}
+          path: metrics_part_${{ matrix.chunk }}.csv
+          if-no-files-found: error
+
+  # ---- 部分CSVを結合して1本化 ----
+  merge:
+    needs: shard
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all parts
+        uses: actions/download-artifact@v4
+        with:
+          path: parts
+
+      - name: Merge parts into metrics.csv
+        run: |
+          set -e
+          ls -R parts
+          # 先頭のヘッダは一回だけ。それ以外は2行目以降を連結
+          FIRST=true
+          rm -f metrics.csv
+          for f in $(ls parts/**/metrics_part_*.csv | sort); do
+            if $FIRST; then
+              cat "$f" > metrics.csv
+              FIRST=false
+            else
+              tail -n +2 "$f" >> metrics.csv
+            fi
+          done
+          echo "Merged CSV head:"
+          head -n 10 metrics.csv
+
+      # リポジトリ直下にコミット（Sheetsのrawで読む用）
+      - name: Commit metrics.csv to repo
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add metrics.csv
+          git commit -m "merge metrics" || echo "no changes"
+          git push
+
+      # Pages のアーティファクトとしてアップロード
+      - name: Prepare site dir
+        run: mkdir -p site && cp metrics.csv site/
+
+      - name: Upload artifact (Pages)
         uses: actions/upload-pages-artifact@v3
         with:
           path: site
 
+  # ---- Pages へデプロイ ----
   deploy:
-    needs: build
+    needs: merge
     runs-on: ubuntu-latest
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      # ← 公式デプロイアクション（gh-pagesブランチは使わない）
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
