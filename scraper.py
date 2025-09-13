@@ -145,6 +145,16 @@ def to_pct(x):
 def main():
     with open("tickers.txt", "r", encoding="utf-8") as f:
         codes = [line.strip() for line in f if line.strip()]
+
+    # 並列分割用：環境変数 OFFSET / MAX_TICKERS に対応
+    offset = int(os.getenv("OFFSET", "0"))
+    limit  = int(os.getenv("MAX_TICKERS", "0"))
+    if limit > 0:
+        codes = codes[offset:offset+limit]
+
+    total = len(codes)
+    print(f"Total tickers to process in this shard: {total}", flush=True)
+    
     out = []
     for i, code in enumerate(codes, 1):
         print(f"[{i}/{len(codes)}] {code}")
