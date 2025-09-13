@@ -1,6 +1,5 @@
 import re, csv, time, math
 import requests
-from lxml import html
 
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 IR_CSV = "https://f.irbank.net/files/{code}/{path}"
