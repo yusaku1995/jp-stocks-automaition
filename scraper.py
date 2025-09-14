@@ -21,9 +21,9 @@ def _headers():
 RETRIES = 6
 
 # ====== Endpoints ======
-IR_CSV  = "https://f.irbank.net/files/{code}/{path}"               # CSVは4桁数字で安定（英字は多くが無い）
-IR_HTML = "https://irbank.net/{code}"                               # HTMLは英字付きも可（フォールバックに使用）
-STOOQ   = "https://stooq.com/q/d/l/?s={code}.jp&i=d"               # 英字付きもそのまま投げる
+IR_CSV  = "https://f.irbank.net/files/{code}/{path}"
+IR_HTML = "https://irbank.net/{code}"
+STOOQ   = "https://stooq.com/q/d/l/?s={code}.jp&i=d"
 KABU_OVERVIEW = "https://kabutan.jp/stock/?code={code}"
 KABU_FINANCE  = "https://kabutan.jp/stock/finance?code={code}"
 KABU_KABUKA   = "https://kabutan.jp/stock/kabuka?code={code}&ashi=day&page={page}"
@@ -111,7 +111,6 @@ def last_num_in_row(rows, ridx):
     return ""
 
 def get_csv(code, path):
-    # CSVは4桁数字で安定。英字付きは多くが存在しないため試行しても404が多い。
     if not is_numeric4(code):
         print(f"[SKIP] IRBANK CSV likely missing for non-4digit: {code}", flush=True)
         return None
@@ -207,12 +206,26 @@ def _get_first_text_by_xpath(url, xp):
     return ""
 
 def _fetch_text(url):
-    """ページ全文テキスト（HTMLそのもの）を返す。失敗時は空文字。"""
     for i in range(3):
         try:
             r = requests.get(url, headers=_headers(), timeout=25)
             if r.status_code == 200 and r.text:
                 return r.text
+            else:
+                print(f"[WARN] HTML HTTP {r.status_code}: {url}", flush=True)
+        except Exception as e:
+            print(f"[ERR] HTML fetch {url} -> {e}", flush=True)
+        polite_sleep(1.0 + i)
+    return ""
+
+def _fetch_text_from_dom(url):
+    """DOM化→text_content()で可視テキストを抽出（script/style等を除去）。"""
+    for i in range(3):
+        try:
+            r = requests.get(url, headers=_headers(), timeout=25)
+            if r.status_code == 200 and r.text:
+                doc = LH.fromstring(r.text)
+                return doc.text_content()
             else:
                 print(f"[WARN] HTML HTTP {r.status_code}: {url}", flush=True)
         except Exception as e:
@@ -227,13 +240,12 @@ def _num_only(s):
     return m.group(1) if m else ""
 
 def _num_pct_sane(s):
-    """数値文字列を%として採用。±1000% を超える異常値は空にする。"""
     v = _num_only(s)
     if v == "": return ""
     try:
         f = float(v)
         if abs(f) > 1000:
-            return ""    # 異常な巨大値は無効化
+            return ""
         return str(f)
     except:
         return ""
@@ -272,12 +284,10 @@ def kabu_roe_pct(code):
         v = _num_pct_sane(t)
         if v != "":
             return v
-    # IRBANK fallback
     t = _get_first_text_by_xpath(IR_HTML.format(code=code), "(//*[contains(text(),'ROE')])[1]/following::text()[1]")
     return _num_pct_sane(t)
 
 def kabu_divy_pct(code):
-    # ％をそのまま取る（再計算しない）
     url = KABU_OVERVIEW.format(code=code)
     for xp in [
         "//th[.//text()[contains(.,'配当利回り')]]/following-sibling::td[1]",
@@ -288,7 +298,6 @@ def kabu_divy_pct(code):
         v = _num_pct_sane(t)
         if v != "":
             return v
-    # IRBANK fallback
     t = _get_first_text_by_xpath(IR_HTML.format(code=code), "(//*[contains(text(),'配当利回り')])[1]/following::text()[1]")
     return _num_pct_sane(t)
 
@@ -303,10 +312,10 @@ def kabu_credit(code):
     return _num_only(t)
 
 def kabu_equity_ratio_pct(code):
-    """自己資本比率。まずXPath、ダメならページ全文を正規表現で強制抽出、さらにIRBANKにもフォールバック。"""
+    """自己資本比率。XPath→HTML全文regex→DOMテキストregex→IRBANK→CSV算出の多段フォールバック。"""
     url_f = KABU_FINANCE.format(code=code)
 
-    # 1) XPathで探す
+    # 1) XPath
     for xp in [
         "//th[.//text()[contains(.,'自己資本比率')]]/following-sibling::td[1]",
         "//*[contains(text(),'自己資本比率')]/following::td[1]",
@@ -317,7 +326,7 @@ def kabu_equity_ratio_pct(code):
         if v != "":
             return v
 
-    # 2) Financeページ全文から正規表現で％抜き
+    # 2) Finance ページ HTML生テキストからregex
     html_txt = _fetch_text(url_f)
     if html_txt:
         m = re.search(r"自己資本比率[^0-9\-]*(\-?\d+(?:\.\d+)?)\s*%", html_txt)
@@ -326,7 +335,16 @@ def kabu_equity_ratio_pct(code):
             if v != "":
                 return v
 
-    # 3) 概要ページにもたまに出る
+    # 3) Finance ページを DOM から text_content() で平文化してregex
+    dom_txt = _fetch_text_from_dom(url_f)
+    if dom_txt:
+        m = re.search(r"自己資本比率[^0-9\-]*(\-?\d+(?:\.\d+)?)\s*%", dom_txt)
+        if m:
+            v = _num_pct_sane(m.group(1))
+            if v != "":
+                return v
+
+    # 4) 概要ページ（HTML→regex、DOM→regexも両方）
     html_o = _fetch_text(KABU_OVERVIEW.format(code=code))
     if html_o:
         m = re.search(r"自己資本比率[^0-9\-]*(\-?\d+(?:\.\d+)?)\s*%", html_o)
@@ -334,8 +352,15 @@ def kabu_equity_ratio_pct(code):
             v = _num_pct_sane(m.group(1))
             if v != "":
                 return v
+    dom_o = _fetch_text_from_dom(KABU_OVERVIEW.format(code=code))
+    if dom_o:
+        m = re.search(r"自己資本比率[^0-9\-]*(\-?\d+(?:\.\d+)?)\s*%", dom_o)
+        if m:
+            v = _num_pct_sane(m.group(1))
+            if v != "":
+                return v
 
-    # 4) IRBANK HTML（テキスト検索）
+    # 5) IRBANK HTML（regex/DOM両方）
     html_ir = _fetch_text(IR_HTML.format(code=code))
     if html_ir:
         m = re.search(r"自己資本比率[^0-9\-]*(\-?\d+(?:\.\d+)?)\s*%", html_ir)
@@ -343,8 +368,15 @@ def kabu_equity_ratio_pct(code):
             v = _num_pct_sane(m.group(1))
             if v != "":
                 return v
+    dom_ir = _fetch_text_from_dom(IR_HTML.format(code=code))
+    if dom_ir:
+        m = re.search(r"自己資本比率[^0-9\-]*(\-?\d+(?:\.\d+)?)\s*%", dom_ir)
+        if m:
+            v = _num_pct_sane(m.group(1))
+            if v != "":
+                return v
 
-    # 5) IRBANK CSVからの算出（eq/assets が取れた場合）
+    # 6) IRBANK CSV算出（4桁のみ）
     eps, bps, ni, eq, assets, dps = fetch_eps_bps_profit_equity_assets_dps(code)
     if eq != "" and assets != "":
         ratio = safe_div(eq, assets)
@@ -361,7 +393,6 @@ def ir_credit(code):
 
 # ====== Volumes (5/25) ======
 def stooq_vols_any(code):
-    """Stooqにそのまま投げる（215A など英字付きもユーザー環境で取得可想定）"""
     url = STOOQ.format(code=code)
     for i in range(3):
         try:
@@ -391,7 +422,6 @@ def stooq_vols_any(code):
     return "", "", ""
 
 def kabutan_vols_any(code):
-    """株探『過去の株価』から出来高25営業日ぶん以上を収集（フォールバック用）"""
     vols = []
     page = 1
     while len(vols) < 25 and page <= 5:
@@ -472,13 +502,13 @@ def main():
         pbr      = kabu_pbr(code) or ir_pbr(code) or ""
         roe_pct  = kabu_roe_pct(code) or (str(roe_pct_calc) if roe_pct_calc != "" else "")
         eqr_pct  = kabu_equity_ratio_pct(code) or (str(eqr_pct_calc) if eqr_pct_calc != "" else "")
-        divy_pct = kabu_divy_pct(code)  # %をそのまま
+        divy_pct = kabu_divy_pct(code)
         credit   = kabu_credit(code) or ir_credit(code) or ""
 
         if i == 1:
             print(f"[DEBUG] {code} per={per} pbr={pbr} roe%={roe_pct} eqr%={eqr_pct} divy%={divy_pct} credit={credit} v5={vol5} v25={vol25} vr={vratio}", flush=True)
 
-        op_yoy = fetch_opinc_yoy(code)  # 英字付きは空のことが多い
+        op_yoy = fetch_opinc_yoy(code)
 
         out.append([
             code,
