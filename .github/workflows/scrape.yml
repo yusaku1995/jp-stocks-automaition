@@ -15,6 +15,7 @@ jobs:
     timeout-minutes: 25
     strategy:
       fail-fast: false
+      max-parallel: 1     # ★ シャードを直列実行に
       matrix:
         chunk: [0, 1, 2, 3, 4, 5]   # ← 6分割（必要なら増減OK）
     steps:
