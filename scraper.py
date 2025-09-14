@@ -166,18 +166,65 @@ def fetch_eps_bps_profit_equity_assets_dps(code):
 
     return eps, bps, ni, eq, assets, dps
 
-def fetch_opinc_yoy(code):
-    qq = get_csv(code, CSV_QQ)
-    if not qq:
-        return ""
-    for row in reversed(qq[1:]):
-        if len(row) <= 1:
-            continue
-        s = re.sub(r'[^0-9.\-]', '', row[1] or "")
-        if s in ("", "-", ".", "-."):
-            continue
-        return s
+# ===== op_income_yoy フォールバック追加 =====
+
+def _extract_yoy_from_text(url):
+    """
+    ページ本文から 「営業利益(営業益) ×(前年同期比|前年比|前比) ±NN.N%」 を拾う。
+    DOMのtext_content()でscript/styleを除去してから正規表現検索。
+    見つかった最初の値を返す。
+    """
+    try:
+        r = requests.get(url, headers=_headers(), timeout=25)
+        if r.status_code != 200 or not r.text:
+            print(f"[WARN] HTML HTTP {r.status_code}: {url}", flush=True)
+            return ""
+        doc = LH.fromstring(r.text)
+        text = doc.text_content()  # 可視テキスト
+        text = re.sub(r"\s+", " ", text)
+
+        # 例：
+        # 「営業利益 前年同期比 +12.3%」「営業益 前年比 -8.0%」「営業利益 前比 5.1%」
+        m = re.search(
+            r"(営業利益|営業益)\s*.*?(前年同期比|前年比|前比)\s*[:：]?\s*([+\-]?\d+(?:\.\d+)?)\s*%",
+            text
+        )
+        if m:
+            return m.group(3)  # パーセント数値部分
+    except Exception as e:
+        print(f"[ERR] yoy parse {url} -> {e}", flush=True)
     return ""
+
+
+def fetch_opinc_yoy(code):
+    """
+    1) IRBANK CSV (4桁コード) を試す
+    2) ダメなら Kabutan finance/overview の本文から '営業利益 前年同期比(前年比/前比) %' を拾う
+    3) さらにダメなら IRBANK HTML 本文から同様に拾う
+    """
+    # 1) 既存：IRBANK CSV
+    qq = get_csv(code, CSV_QQ)
+    if qq:
+        for row in reversed(qq[1:]):
+            if len(row) <= 1:
+                continue
+            s = re.sub(r'[^0-9.\-]', '', row[1] or "")
+            if s not in ("", "-", ".", "-."):
+                return s
+
+    # 2) Kabutan 側（財務・概要の両方を試す）
+    for url in (KABU_FINANCE.format(code=code), KABU_OVERVIEW.format(code=code)):
+        v = _extract_yoy_from_text(url)
+        if v != "":
+            return v
+
+    # 3) IRBANK 側（HTML本文）
+    v = _extract_yoy_from_text(IR_HTML.format(code=code))
+    if v != "":
+        return v
+
+    return ""
+
 
 # ====== HTML helpers ======
 _num_re = re.compile(r"(-?\d+(?:\.\d+)?)")
