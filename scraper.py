@@ -66,13 +66,19 @@ CSV_BS = "fy-balance-sheet.csv"
 CSV_DIV= "fy-stock-dividend.csv"
 CSV_QQ_YOY_OP = "qq-yoy-operating-income.csv"
 
-# ← ここに列名キー群（あなたが貼ってくれたもの）を置く
+# 既存の CSV_* 定義の下に追記
+CSV_PS = "fy-per-share.csv"   # ← 1株あたり（EPS/BPS/DPS）が載る
+
+# 既存のキー配列を少し拡張（置き換えでもOK）
 EPS_KEYS = ["EPS","EPS(円)","EPS（円）","1株当たり利益","1株当たり当期純利益","1株当たり当期純利益(円)","1株当たり当期純利益（円）","1株当たり純利益"]
 BPS_KEYS = ["BPS","BPS(円)","BPS（円）","1株当たり純資産","1株当たり純資産(円)","1株当たり純資産（円）","1株純資産"]
+DPS_KEYS = ["1株配当","1株配当金","配当金","配当(円)","配当（円）","1株当たり配当金"]
+
+# 純資産（自己資本）/総資産のラベルも広げる
+EQ_KEYS  = ["自己資本","自己資本合計","株主資本","株主資本合計","純資産","純資産合計"]
+AS_KEYS  = ["総資産","資産合計","資産総額"]
 NI_KEYS  = ["当期純利益","親会社株主に帰属する当期純利益","純利益"]
-EQ_KEYS  = ["自己資本","株主資本","純資産"]
-AS_KEYS  = ["総資産","資産合計"]
-DPS_KEYS = ["1株配当","配当金","配当(円)","配当（円）","1株当たり配当金"]
+
 
 def get_csv(code, path):
     url = IR_CSV.format(code=code, path=path)
@@ -149,18 +155,26 @@ def last_num(rows, idx):
     return num
 
 def fetch_eps_bps_profit_equity_assets_dps(code):
-    pl = get_csv(code, CSV_PL)   # 損益計算書（行見出しに EPS / 当期純利益）
-    bs = get_csv(code, CSV_BS)   # 貸借対照表（行見出しに 自己資本/株主資本/総資産/BPS）
-    dv = get_csv(code, CSV_DIV)  # 配当
+    pl = get_csv(code, CSV_PL)    # 損益
+    bs = get_csv(code, CSV_BS)    # 貸借
+    dv = get_csv(code, CSV_DIV)   # 配当（年次）
+    ps = get_csv(code, CSV_PS)    # ★ 1株あたり（EPS/BPS/DPS）
 
     eps = bps = netinc = equity = assets = dps = ""
 
+    # ---- 損益（EPS / 純利益） ----
     if pl:
         eps_row = row_index_by_keys(pl, EPS_KEYS)
         ni_row  = row_index_by_keys(pl, NI_KEYS)
         eps     = last_num_in_row(pl, eps_row)
         netinc  = last_num_in_row(pl, ni_row)
 
+    # ★ EPSが空なら per-share から拾う
+    if (eps == "") and ps:
+        eps_row_ps = row_index_by_keys(ps, EPS_KEYS)
+        eps        = last_num_in_row(ps, eps_row_ps)
+
+    # ---- 貸借（BPS / 自己資本 / 総資産）----
     if bs:
         bps_row = row_index_by_keys(bs, BPS_KEYS)
         eq_row  = row_index_by_keys(bs, EQ_KEYS)
@@ -169,11 +183,23 @@ def fetch_eps_bps_profit_equity_assets_dps(code):
         equity  = last_num_in_row(bs, eq_row)
         assets  = last_num_in_row(bs, as_row)
 
+    # ★ BPSが空なら per-share から拾う
+    if (bps == "") and ps:
+        bps_row_ps = row_index_by_keys(ps, BPS_KEYS)
+        bps        = last_num_in_row(ps, bps_row_ps)
+
+    # ---- 配当（DPS）----
     if dv:
         dps_row = row_index_by_keys(dv, DPS_KEYS)
         dps     = last_num_in_row(dv, dps_row)
 
+    # ★ DPSが空なら per-share から拾う
+    if (dps == "") and ps:
+        dps_row_ps = row_index_by_keys(ps, DPS_KEYS)
+        dps        = last_num_in_row(ps, dps_row_ps)
+
     return eps, bps, netinc, equity, assets, dps
+
 
 
 
@@ -291,8 +317,9 @@ def main():
             dps = last_num(dv, dps_idx)
 
         # 1件目だけDEBUG詳細
-        if i == 1:
-            print(f"[DEBUG] {code} eps={eps} bps={bps} ni={netinc} eq={equity} as={assets} dps={dps}", flush=True)
+if i == 1:
+    print(f"[DEBUG] {code} eps={eps} bps={bps} ni={netinc} eq={equity} as={assets} dps={dps}", flush=True)
+
 
         per = safe_div(close, eps) if (close is not None) else ""
         pbr = safe_div(close, bps) if (close is not None) else ""
