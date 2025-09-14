@@ -449,13 +449,16 @@ def _finance_pick_latest_number(url, label_keywords):
 
 def kabu_equity_ratio_pct(code):
     """
-    株探→（取れなければ）IRBANKの順で自己資本比率(%)を抽出。
-    ・表記ゆれ（連結/単体/国内・国際基準）に対応
-    ・table/ul/dl など構造差異に強いXPathを複数用意
-    ・%の異常値(±1000%)は無効化
-    ・見つからなければ空文字
+    自己資本比率(%)を取得。
+    1) 株探 財務ページの複数XPath
+    2) 株探 概要ページの複数XPath
+    3) 株探 財務/概要のページ全文 正規表現
+    4) IRBANK HTMLの複数XPath
+    5) IRBANK HTML 全文 正規表現
+    の順で探索し、最初に見つかった%値を返す。
+    見つからなければ空文字。
     """
-    def _fetch(url, xps):
+    def _try_xpaths(url, xps):
         for xp in xps:
             t = _get_first_text_by_xpath(url, xp)
             v = _num_pct_sane(t)
@@ -463,62 +466,66 @@ def kabu_equity_ratio_pct(code):
                 return v
         return ""
 
-    # ---------- 1) 株探（財務） ----------
+    def _try_regex(url):
+        try:
+            r = requests.get(url, headers=_headers(), timeout=25)
+            if r.status_code == 200 and r.text:
+                # 「自己資本比率」から近傍(最長80文字)に出る数値% を拾う
+                m = re.search(r"自己資本比率[^%]{0,80}?([+\-]?\d+(?:\.\d+)?)\s*%", r.text)
+                if m:
+                    return _num_pct_sane(m.group(1))
+        except Exception:
+            pass
+        return ""
+
+    # 1) 株探 財務
     url_f = KABU_FINANCE.format(code=code)
-    # 「自己資本比率」を含む行・定義リストを幅広く拾う
-    kabu_xps = [
-        # テーブル系
+    xps_f = [
         "//tr[.//*[contains(normalize-space(.),'自己資本比率')]]/*[self::td or self::th][last()]",
         "//th[contains(.,'自己資本比率')]/following-sibling::td[1]",
         "//*[contains(text(),'自己資本比率')]/following::td[1]",
-        # 定義リスト/その他
         "//*[contains(text(),'自己資本比率')]/ancestor::*[self::tr or self::li or self::dl or self::div][1]/*[self::td or self::dd][1]",
-        # 連結/単体などのバリエーションも拾う
         "//*[contains(normalize-space(.),'自己資本比率') and (contains(.,'連結') or contains(.,'単体') or contains(.,'国内') or contains(.,'国際'))]/following::*[self::td or self::dd][1]"
     ]
-    v = _fetch(url_f, kabu_xps)
+    v = _try_xpaths(url_f, xps_f)
     if v != "":
         return v
 
-    # 概要ページ側に出るケースの保険
+    # 2) 株探 概要
     url_o = KABU_OVERVIEW.format(code=code)
-    kabu_overview_xps = [
+    xps_o = [
         "//*[contains(text(),'自己資本比率')][1]/following::text()[1]",
         "//*[contains(text(),'自己資本比率')]/ancestor::*[self::tr or self::li][1]/*[self::td or self::dd][1]"
     ]
-    v = _fetch(url_o, kabu_overview_xps)
+    v = _try_xpaths(url_o, xps_o)
     if v != "":
         return v
 
-    # ---------- 2) IRBANK（HTMLフォールバック） ----------
+    # 3) 株探 全文 正規表現（財務→概要の順）
+    v = _try_regex(url_f)
+    if v != "":
+        return v
+    v = _try_regex(url_o)
+    if v != "":
+        return v
+
+    # 4) IRBANK HTML
     url_ir = IR_HTML.format(code=code)
-    irbank_xps = [
+    xps_ir = [
         "(//*[contains(text(),'自己資本比率')])[1]/following::text()[1]",
         "//*[contains(text(),'自己資本比率')]/ancestor::*[self::tr or self::li or self::dl or self::div][1]/*[self::td or self::dd][1]"
     ]
-    v = _fetch(url_ir, irbank_xps)
+    v = _try_xpaths(url_ir, xps_ir)
     if v != "":
         return v
 
-    # ---------- 3) 最終保険：ページ全文から正規表現 ----------
-    try:
-        r = requests.get(url_f, headers=_headers(), timeout=25)
-        if r.status_code == 200 and r.text:
-            m = re.search(r"自己資本比率[^%]{0,80}?([+\-]?\d+(?:\.\d+)?)\s*%", r.text)
-            if m:
-                return _num_pct_sane(m.group(1))
-    except Exception:
-        pass
-    try:
-        r = requests.get(url_ir, headers=_headers(), timeout=25)
-        if r.status_code == 200 and r.text:
-            m = re.search(r"自己資本比率[^%]{0,80}?([+\-]?\d+(?:\.\d+)?)\s*%", r.text)
-            if m:
-                return _num_pct_sane(m.group(1))
-    except Exception:
-        pass
+    # 5) IRBANK 全文 正規表現
+    v = _try_regex(url_ir)
+    if v != "":
+        return v
 
     return ""
+
 
 
 def ir_pbr(code):
