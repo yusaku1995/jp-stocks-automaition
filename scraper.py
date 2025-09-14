@@ -1,22 +1,23 @@
 import os, io, csv, re, time, requests
-HEADERS = {"User-Agent": "Mozilla/5.0"}
-RETRIES = 6  # ←増やす
-
-import re, csv, time, math
 import requests
-import os
 
-HEADERS = {"User-Agent": "Mozilla/5.0"}
+HEADERS = {
+    "User-Agent": "Mozilla/5.0",
+    "Accept": "text/csv, text/plain;q=0.9, */*;q=0.8",
+    "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+}
+RETRIES = 6  # リトライ回数を増やす
+
 IR_CSV = "https://f.irbank.net/files/{code}/{path}"
 STOOQ = "https://stooq.com/q/d/l/?s={code}.jp&i=d"
 MARGIN = "https://irbank.net/{code}/margin"
 
-# CSV paths on IRBANK
-CSV_PL = "fy-profit-and-loss.csv"      # includes EPS, 当期純利益, etc.
-CSV_BS = "fy-balance-sheet.csv"        # includes BPS, 自己資本, 総資産, etc.
-CSV_DIV= "fy-stock-dividend.csv"       # includes 1株配当
+CSV_PL = "fy-profit-and-loss.csv"
+CSV_BS = "fy-balance-sheet.csv"
+CSV_DIV= "fy-stock-dividend.csv"
 CSV_QQ_YOY_OP = "qq-yoy-operating-income.csv"
 
+# ← ここに列名キー群（あなたが貼ってくれたもの）を置く
 EPS_KEYS = ["EPS","EPS(円)","EPS（円）","1株当たり利益","1株当たり当期純利益","1株当たり純利益"]
 BPS_KEYS = ["BPS","BPS(円)","BPS（円）","1株当たり純資産","1株純資産"]
 NI_KEYS  = ["当期純利益","親会社株主に帰属する当期純利益","純利益"]
