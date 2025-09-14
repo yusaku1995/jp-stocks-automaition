@@ -1,3 +1,7 @@
+import os, io, csv, re, time, requests
+HEADERS = {"User-Agent": "Mozilla/5.0"}
+RETRIES = 6  # ←増やす
+
 import re, csv, time, math
 import requests
 import os
@@ -13,17 +17,26 @@ CSV_BS = "fy-balance-sheet.csv"        # includes BPS, 自己資本, 総資産, 
 CSV_DIV= "fy-stock-dividend.csv"       # includes 1株配当
 CSV_QQ_YOY_OP = "qq-yoy-operating-income.csv"
 
+EPS_KEYS = ["EPS","EPS(円)","EPS（円）","1株当たり利益","1株当たり当期純利益","1株当たり純利益"]
+BPS_KEYS = ["BPS","BPS(円)","BPS（円）","1株当たり純資産","1株純資産"]
+NI_KEYS  = ["当期純利益","親会社株主に帰属する当期純利益","純利益"]
+EQ_KEYS  = ["自己資本","株主資本","純資産"]
+AS_KEYS  = ["総資産","資産合計"]
+DPS_KEYS = ["1株配当","配当金","配当(円)","配当（円）"]
+
+
 def get_csv(code, path):
     url = IR_CSV.format(code=code, path=path)
-    for i in range(3):
+    for i in range(RETRIES):
         try:
-            r = requests.get(url, headers=HEADERS, timeout=25)
-            if r.status_code == 200 and len(r.text.strip().splitlines()) >= 2:
-                return [row.split(',') for row in r.text.strip().splitlines()]
+            r = requests.get(url, headers=HEADERS, timeout=20)
+            if r.ok and "\n" in r.text:
+                return list(csv.reader(io.StringIO(r.text)))
         except Exception:
             pass
-        time.sleep(1 + i)
+        time.sleep(2*(i+1))  # エクスポネンシャル風バックオフ
     return None
+
 
 def col_index(header_row, keys):
     # find first header that matches any of keys (exact or contains)
@@ -52,26 +65,27 @@ def fetch_eps_bps_profit_equity_assets_dps(code):
 
     if pl:
         h = pl[0]
-        eps_idx = col_index(h, ["EPS","1株当たり利益"])
-        ni_idx  = col_index(h, ["当期純利益","純利益"])
+        eps_idx = col_index(h, EPS_KEYS)
+        ni_idx  = col_index(h, NI_KEYS)
         eps = last_num(pl, eps_idx)
         netinc = last_num(pl, ni_idx)
 
     if bs:
         h = bs[0]
-        bps_idx = col_index(h, ["BPS","1株当たり純資産"])
-        eq_idx  = col_index(h, ["自己資本","純資産"])
-        as_idx  = col_index(h, ["総資産"])
+        bps_idx = col_index(h, BPS_KEYS)
+        eq_idx  = col_index(h, EQ_KEYS)
+        as_idx  = col_index(h, AS_KEYS)
         bps = last_num(bs, bps_idx)
         equity = last_num(bs, eq_idx)
         assets = last_num(bs, as_idx)
 
     if dv:
         h = dv[0]
-        dps_idx = col_index(h, ["1株配当","配当金"])
+        dps_idx = col_index(h, DPS_KEYS)
         dps = last_num(dv, dps_idx)
 
     return eps, bps, netinc, equity, assets, dps
+
 
 def fetch_opinc_yoy(code):
     qq = get_csv(code, CSV_QQ_YOY_OP)
