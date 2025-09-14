@@ -1,6 +1,55 @@
 import os, io, csv, re, time, requests
 import requests
 
+import re
+
+def _norm(s: str) -> str:
+    if s is None:
+        return ""
+    s = str(s)
+    # 括弧内を削除（全角/半角）
+    s = re.sub(r'（.*?）', '', s)
+    s = re.sub(r'\(.*?\)',  '', s)
+    # 記号・空白を削除
+    s = re.sub(r'[\s　,/％%円¥\-–—]', '', s)
+    return s
+
+def row_index_by_keys(rows, keys):
+    """1列目(行見出し)を正規化して keys（正規化済み）と部分一致で探す"""
+    if not rows:
+        return None
+    norm_keys = [_norm(k) for k in keys]
+    for i, r in enumerate(rows):
+        if not r:
+            continue
+        head = _norm(r[0])
+        if not head:
+            continue
+        for nk in norm_keys:
+            # どちらかに含まれていればOK（“1株当たり当期純利益(円)” などを吸収）
+            if nk and (nk in head or head in nk):
+                return i
+    return None
+
+def last_num_in_row(rows, ridx):
+    """その行の右端から数値を拾う（カンマ/空白/記号除去）"""
+    if ridx is None:
+        return ""
+    r = rows[ridx]
+    # 2列目以降が年度データ
+    for x in reversed(r[1:]):
+        if x is None:
+            continue
+        s = str(x).replace(',', '').strip()
+        if s in ("", "-", "—", "–"):
+            continue
+        try:
+            return float(s)
+        except:
+            continue
+    return ""
+
+
 HEADERS = {
     "User-Agent": "Mozilla/5.0",
     "Accept": "text/csv, text/plain;q=0.9, */*;q=0.8",
@@ -18,12 +67,12 @@ CSV_DIV= "fy-stock-dividend.csv"
 CSV_QQ_YOY_OP = "qq-yoy-operating-income.csv"
 
 # ← ここに列名キー群（あなたが貼ってくれたもの）を置く
-EPS_KEYS = ["EPS","EPS(円)","EPS（円）","1株当たり利益","1株当たり当期純利益","1株当たり純利益"]
-BPS_KEYS = ["BPS","BPS(円)","BPS（円）","1株当たり純資産","1株純資産"]
+EPS_KEYS = ["EPS","EPS(円)","EPS（円）","1株当たり利益","1株当たり当期純利益","1株当たり当期純利益(円)","1株当たり当期純利益（円）","1株当たり純利益"]
+BPS_KEYS = ["BPS","BPS(円)","BPS（円）","1株当たり純資産","1株当たり純資産(円)","1株当たり純資産（円）","1株純資産"]
 NI_KEYS  = ["当期純利益","親会社株主に帰属する当期純利益","純利益"]
 EQ_KEYS  = ["自己資本","株主資本","純資産"]
 AS_KEYS  = ["総資産","資産合計"]
-DPS_KEYS = ["1株配当","配当金","配当(円)","配当（円）"]
+DPS_KEYS = ["1株配当","配当金","配当(円)","配当（円）","1株当たり配当金"]
 
 def get_csv(code, path):
     url = IR_CSV.format(code=code, path=path)
