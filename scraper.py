@@ -31,7 +31,6 @@ def get_csv(code, path):
         try:
             r = requests.get(url, headers=HEADERS, timeout=20)
             ctype = r.headers.get("Content-Type","")
-            # HTML等が返ってきたら弾く（高負荷時の制限ページなど）
             if not r.ok:
                 print(f"[WARN] {url} -> HTTP {r.status_code}", flush=True)
             elif "text/csv" not in ctype and "application/octet-stream" not in ctype:
@@ -41,14 +40,45 @@ def get_csv(code, path):
                 rows = list(csv.reader(io.StringIO(r.text)))
                 if len(rows) >= 2:
                     print(f"[OK] {url} rows={len(rows)}", flush=True)
+                    time.sleep(3)  # ★ 取得成功でも一呼吸（礼儀）
                     return rows
-                else:
-                    print(f"[WARN] {url} -> CSV but too short", flush=True)
         except Exception as e:
             print(f"[ERR] {url} -> {e}", flush=True)
-        time.sleep(2*(i+1))  # 少しずつ待ち時間を増やす
+        time.sleep(3 + 2*i)  # ★ リトライごとに待ち時間を延ばす
     print(f"[FAIL] {url} retried {RETRIES}x", flush=True)
     return None
+
+
+def row_index_by_keys(rows, keys):
+    # rows: CSV全体（list of lists）
+    # 1列目(=行見出し)に keys のいずれかが含まれる行番号を返す
+    if not rows: 
+        return None
+    for i, r in enumerate(rows):
+        if not r: 
+            continue
+        head = (r[0] or "").strip()
+        for k in keys:
+            if k in head:
+                return i
+    return None
+
+def last_num_in_row(rows, ridx):
+    # ridx 行の右側から最後に出現する数値を返す（カンマ除去・空白除去）
+    if ridx is None:
+        return ""
+    r = rows[ridx]
+    # 2列目以降が年度ごとの値なので右から探す
+    for x in reversed(r[1:]):
+        s = (x or "").replace(",", "").strip()
+        try:
+            if s == "" or s in ["-", "—", "–"]:
+                continue
+            return float(s)
+        except:
+            continue
+    return ""
+
 
 def col_index(header_row, keys):
     # find first header that matches any of keys (exact or contains)
@@ -70,33 +100,32 @@ def last_num(rows, idx):
     return num
 
 def fetch_eps_bps_profit_equity_assets_dps(code):
-    pl = get_csv(code, CSV_PL)
-    bs = get_csv(code, CSV_BS)
-    dv = get_csv(code, CSV_DIV)
+    pl = get_csv(code, CSV_PL)   # 損益計算書（行見出しに EPS / 当期純利益）
+    bs = get_csv(code, CSV_BS)   # 貸借対照表（行見出しに 自己資本/株主資本/総資産/BPS）
+    dv = get_csv(code, CSV_DIV)  # 配当
+
     eps = bps = netinc = equity = assets = dps = ""
 
     if pl:
-        h = pl[0]
-        eps_idx = col_index(h, EPS_KEYS)
-        ni_idx  = col_index(h, NI_KEYS)
-        eps = last_num(pl, eps_idx)
-        netinc = last_num(pl, ni_idx)
+        eps_row = row_index_by_keys(pl, EPS_KEYS)
+        ni_row  = row_index_by_keys(pl, NI_KEYS)
+        eps     = last_num_in_row(pl, eps_row)
+        netinc  = last_num_in_row(pl, ni_row)
 
     if bs:
-        h = bs[0]
-        bps_idx = col_index(h, BPS_KEYS)
-        eq_idx  = col_index(h, EQ_KEYS)
-        as_idx  = col_index(h, AS_KEYS)
-        bps = last_num(bs, bps_idx)
-        equity = last_num(bs, eq_idx)
-        assets = last_num(bs, as_idx)
+        bps_row = row_index_by_keys(bs, BPS_KEYS)
+        eq_row  = row_index_by_keys(bs, EQ_KEYS)
+        as_row  = row_index_by_keys(bs, AS_KEYS)
+        bps     = last_num_in_row(bs, bps_row)
+        equity  = last_num_in_row(bs, eq_row)
+        assets  = last_num_in_row(bs, as_row)
 
     if dv:
-        h = dv[0]
-        dps_idx = col_index(h, DPS_KEYS)
-        dps = last_num(dv, dps_idx)
+        dps_row = row_index_by_keys(dv, DPS_KEYS)
+        dps     = last_num_in_row(dv, dps_row)
 
     return eps, bps, netinc, equity, assets, dps
+
 
 
 def fetch_opinc_yoy(code):
