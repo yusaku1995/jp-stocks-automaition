@@ -4,20 +4,33 @@ import io
 import csv
 import re
 import time
+import random
 import requests
 
 # ====== 設定 ======
-HEADERS = {
-    "User-Agent": "Mozilla/5.0",
-    "Accept": "text/csv, text/plain;q=0.9, */*;q=0.8",
-    "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
-}
-RETRIES = 6   # CSV取得のリトライ回数（必要なら増やす）
+UA_POOL = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+]
+def _headers():
+    return {
+        "User-Agent": random.choice(UA_POOL),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,text/csv,*/*;q=0.8",
+        "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+        "Cache-Control": "no-cache",
+    }
+
+RETRIES = 6   # リトライ回数
 
 # IRBANK（CSV）/ Stooq（株価）/ IRBANK（信用）
 IR_CSV = "https://f.irbank.net/files/{code}/{path}"
 STOOQ  = "https://stooq.com/q/d/l/?s={code}.jp&i=d"
 MARGIN = "https://irbank.net/{code}/margin"
+
+# Kabutan（HTML）
+KABU_OVERVIEW = "https://kabutan.jp/stock/?code={code}"
+KABU_FINANCE  = "https://kabutan.jp/stock/finance?code={code}"
 
 # CSV ファイル（IRBANK）
 CSV_PL        = "fy-profit-and-loss.csv"       # 損益
@@ -43,7 +56,7 @@ EQ_KEYS  = ["自己資本","自己資本合計","株主資本","株主資本合�
 AS_KEYS  = ["総資産","資産合計","資産総額"]
 NI_KEYS  = ["当期純利益","親会社株主に帰属する当期純利益","純利益"]
 
-# ====== ユーティリティ ======
+# ====== ユーティリティ（正規化/パース） ======
 def _norm(s: str) -> str:
     """行ラベルの正規化（括弧内削除、空白・記号除去）"""
     if s is None:
@@ -87,12 +100,31 @@ def last_num_in_row(rows, ridx):
             continue
     return ""
 
+def safe_div(a, b):
+    try:
+        a = float(a); b = float(b)
+        if b == 0:
+            return ""
+        return a / b
+    except:
+        return ""
+
+def to_pct(x):
+    try:
+        return float(x) * 100.0
+    except:
+        return ""
+
+def polite_sleep(sec):
+    time.sleep(sec + random.uniform(0.1, 0.7))
+
+# ====== 取得系 ======
 def get_csv(code, path):
     """IRBANKのCSVを取得（CSV以外＝制限ページを弾く、丁寧なバックオフ）"""
     url = IR_CSV.format(code=code, path=path)
     for i in range(RETRIES):
         try:
-            r = requests.get(url, headers=HEADERS, timeout=20)
+            r = requests.get(url, headers=_headers(), timeout=20)
             ctype = r.headers.get("Content-Type","")
             if not r.ok:
                 print(f"[WARN] {url} -> HTTP {r.status_code}", flush=True)
@@ -103,13 +135,13 @@ def get_csv(code, path):
                 rows = list(csv.reader(io.StringIO(r.text)))
                 if len(rows) >= 2:
                     print(f"[OK] {url} rows={len(rows)}", flush=True)
-                    time.sleep(3)  # 成功時でも一拍（アクセス礼儀）
+                    polite_sleep(2.5)  # 成功時でも一拍（アクセス礼儀）
                     return rows
                 else:
                     print(f"[WARN] {url} -> CSV but too short", flush=True)
         except Exception as e:
             print(f"[ERR] {url} -> {e}", flush=True)
-        time.sleep(3 + 2*i)  # リトライごとに待機を増やす
+        polite_sleep(2 + 2*i)  # リトライごとに待機を増やす
     print(f"[FAIL] {url} retried {RETRIES}x", flush=True)
     return None
 
@@ -165,9 +197,8 @@ def fetch_opinc_yoy(code):
     qq = get_csv(code, CSV_QQ_YOY_OP)
     if not qq:
         return ""
-    # 2列目にYoY%が入る形式（末尾から有効値を拾う）
-    for row in reversed(qq[1:]):
-        if len(row) <= 1:
+    for row in reversed(qq[1:]):  # 2列目がYoY%
+        if len(row) <= 1: 
             continue
         s = re.sub(r'[^0-9.\-]', '', (row[1] or ""))
         if s in ("", "-", ".", "-."):
@@ -180,7 +211,7 @@ def stooq_close_vols(code):
     url = STOOQ.format(code=code)
     for i in range(3):
         try:
-            r = requests.get(url, headers=HEADERS, timeout=15)
+            r = requests.get(url, headers=_headers(), timeout=15)
             if r.status_code == 200 and "\n" in r.text:
                 lines = [x.split(',') for x in r.text.strip().splitlines()]
                 if len(lines) >= 2:
@@ -214,89 +245,45 @@ def stooq_close_vols(code):
                 print(f"[WARN] {url} HTTP {r.status_code}", flush=True)
         except Exception as e:
             print(f"[ERR] {url} -> {e}", flush=True)
-        time.sleep(1 + i)
+        polite_sleep(1 + i)
     print(f"[FAIL] {url}", flush=True)
     return None, "", "", ""
 
-def fetch_credit_ratio(code):
-    """信用倍率をHTMLから正規表現で取得。取れなければ空。"""
-    url = MARGIN.format(code=code)
+# ====== Kabutan フォールバック ======
+# 概要ページ（PER/PBR/ROE/配当利回り/信用倍率などが載る）
+RE_PER  = re.compile(r"PER[^0-9]*(\d+(?:\.\d+)?)\s*倍")
+RE_PBR  = re.compile(r"PBR[^0-9]*(\d+(?:\.\d+)?)\s*倍")
+RE_ROE  = re.compile(r"ROE[^0-9]*(\d+(?:\.\d+)?)\s*%")
+RE_DIVY = re.compile(r"配当利回り[^0-9]*(\d+(?:\.\d+)?)\s*%")
+RE_CRED = re.compile(r"信用倍率[^0-9]*(\d+(?:\.\d+)?)\s*倍")
+# 財務ページ（自己資本比率）
+RE_EQR  = re.compile(r"自己資本比率[^0-9]*(\d+(?:\.\d+)?)\s*%")
+
+def fetch_kabutan_overview(code):
+    url = KABU_OVERVIEW.format(code=code)
     for i in range(3):
         try:
-            r = requests.get(url, headers=HEADERS, timeout=25)
-            if r.status_code == 200:
-                text = r.text
-                m = re.search(r"信用倍率[^0-9]*(\d+(?:\.\d+)?)倍", text)
-                if m:
-                    return m.group(1)
-        except Exception:
-            pass
-        time.sleep(1 + i)
-    return ""
+            r = requests.get(url, headers=_headers(), timeout=25)
+            if r.status_code == 200 and r.text:
+                t = r.text
+                out = {}
+                m = RE_PER.search(t);  out["per"]  = m.group(1) if m else ""
+                m = RE_PBR.search(t);  out["pbr"]  = m.group(1) if m else ""
+                m = RE_ROE.search(t);  out["roe_pct"] = m.group(1) if m else ""
+                m = RE_DIVY.search(t); out["divy_pct"] = m.group(1) if m else ""
+                m = RE_CRED.search(t); out["credit_ratio"] = m.group(1) if m else ""
+                if any(out.values()):
+                    print(f"[OK] kabutan overview {code} -> {out}", flush=True)
+                    polite_sleep(1.5)
+                    return out
+                else:
+                    print(f"[WARN] kabutan overview {code} no matches", flush=True)
+            else:
+                print(f"[WARN] kabutan overview {code} HTTP {r.status_code}", flush=True)
+        except Exception as e:
+            print(f"[ERR] kabutan overview {code} -> {e}", flush=True)
+        polite_sleep(2 + i)
+    return {"per":"", "pbr":"", "roe_pct":"", "divy_pct":"", "credit_ratio":""}
 
-def safe_div(a, b):
-    try:
-        a = float(a); b = float(b)
-        if b == 0:
-            return ""
-        return a / b
-    except:
-        return ""
-
-def to_pct(x):
-    try:
-        return float(x) * 100.0
-    except:
-        return ""
-
-# ====== メイン ======
-def main():
-    with open("tickers.txt", "r", encoding="utf-8") as f:
-        codes = [line.strip() for line in f if line.strip()]
-
-    # 並列シャード用（OFFSET/LIMIT）
-    offset = int(os.getenv("OFFSET", "0"))
-    limit  = int(os.getenv("MAX_TICKERS", "0"))
-    if limit > 0:
-        codes = codes[offset:offset+limit]
-
-    total = len(codes)
-    print(f"Total tickers to process in this shard: {total}", flush=True)
-
-    out = []
-    for i, code in enumerate(codes, 1):
-        print(f"[{i}/{total}] {code} start", flush=True)
-
-        # 株価・出来高
-        close, vol5, vol25, vratio = stooq_close_vols(code)
-
-        # 財務系（フォールバック込み）
-        eps, bps, netinc, equity, assets, dps = fetch_eps_bps_profit_equity_assets_dps(code)
-
-        # 指標計算
-        per      = safe_div(close, eps) if (close is not None and eps != "") else ""
-        pbr      = safe_div(close, bps) if (close is not None and bps != "") else ""
-        roe      = safe_div(netinc, equity) if (netinc != "" and equity != "") else ""
-        roe_pct  = to_pct(roe) if roe != "" else ""
-        eq_ratio = safe_div(equity, assets) if (equity != "" and assets != "") else ""
-        eq_ratio_pct = to_pct(eq_ratio) if eq_ratio != "" else ""
-        dy       = safe_div(dps, close) if (dps != "" and close not in (None, "")) else ""
-        dy_pct   = to_pct(dy) if dy != "" else ""
-
-        # 参考系（任意）
-        op_yoy = fetch_opinc_yoy(code)     # 四半期 営業益YoY（空でもOK）
-        credit = fetch_credit_ratio(code)  # 信用倍率（時間帯により空のことあり）
-
-        # 最初の1銘柄だけデバッグ
-        if i == 1:
-            print(f"[DEBUG] {code} eps={eps} bps={bps} ni={netinc} eq={equity} as={assets} dps={dps}", flush=True)
-            print(f"[DEBUG] per={per} pbr={pbr} roe%={roe_pct} eqr%={eq_ratio_pct} divy%={dy_pct}", flush=True)
-
-        out.append([
-            code,
-            close if close is not None else "",
-            per, pbr, roe_pct, eq_ratio_pct,
-            dy_pct, op_yoy, credit, vol5, vol25, vratio
-        ])
-
-        t
+def fetch_kabutan_finance(code):
+    url = KABU_FIN
