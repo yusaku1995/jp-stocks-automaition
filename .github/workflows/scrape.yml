@@ -8,23 +8,40 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: write     # metrics.csv をコミット
-  pages: write        # Pages へ公開
+  contents: write
+  pages: write
   id-token: write
 
 jobs:
-  # ---- 並列シャーディング ----
   shard:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     strategy:
       fail-fast: false
-      # ▼まずは 3 並列で安定運用（様子を見て 2 or 4 に調整）
-      max-parallel: 3
-      # ▼シャード数（= PARTS）。124銘柄テストなら 12 が目安
+      max-parallel: 3              # ★ 安定重視で3並列
       matrix:
-        chunk: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
-        PARTS: [12]
+        # 最大200シャード。銘柄数を超えた分は自動スキップ
+        chunk: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9,
+                10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+                20, 21, 22, 23, 24, 25, 26, 27, 28, 29,
+                30, 31, 32, 33, 34, 35, 36, 37, 38, 39,
+                40, 41, 42, 43, 44, 45, 46, 47, 48, 49,
+                50, 51, 52, 53, 54, 55, 56, 57, 58, 59,
+                60, 61, 62, 63, 64, 65, 66, 67, 68, 69,
+                70, 71, 72, 73, 74, 75, 76, 77, 78, 79,
+                80, 81, 82, 83, 84, 85, 86, 87, 88, 89,
+                90, 91, 92, 93, 94, 95, 96, 97, 98, 99,
+                100,101,102,103,104,105,106,107,108,109,
+                110,111,112,113,114,115,116,117,118,119,
+                120,121,122,123,124,125,126,127,128,129,
+                130,131,132,133,134,135,136,137,138,139,
+                140,141,142,143,144,145,146,147,148,149,
+                150,151,152,153,154,155,156,157,158,159,
+                160,161,162,163,164,165,166,167,168,169,
+                170,171,172,173,174,175,176,177,178,179,
+                180,181,182,183,184,185,186,187,188,189,
+                190,191,192,193,194,195,196,197,198,199]
+
     steps:
       - uses: actions/checkout@v4
 
@@ -32,14 +49,10 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install lxml (XPath用)
+      - name: Install base deps
         run: |
           python -m pip install --upgrade pip
           pip install lxml
-
-      - name: Install requirements
-        run: |
-          python -m pip install --upgrade pip
           pip install --retries 5 --timeout 60 -r requirements.txt
 
       - name: Ensure tickers.txt exists
@@ -49,33 +62,43 @@ jobs:
           head -n 10 tickers.txt || true
           echo "Total:" $(wc -l < tickers.txt || echo 0)
 
-      - name: Compute OFFSET & LIMIT for this shard
+      - name: Decide this shard target
         id: cut
         run: |
           TOTAL=$(wc -l < tickers.txt)
-          PARTS=${{ matrix.PARTS }}
-          # 端数切り上げで1シャード当たり件数を計算
-          PER=$(( (TOTAL + PARTS - 1) / PARTS ))
-          OFFSET=$(( ${{ matrix.chunk }} * PER ))
-          echo "TOTAL=${TOTAL}, PARTS=${PARTS}, PER=${PER}, OFFSET=${OFFSET}"
-          echo "OFFSET=${OFFSET}" >> $GITHUB_ENV
-          echo "MAX_TICKERS=${PER}" >> $GITHUB_ENV
+          CHUNK=${{ matrix.chunk }}
+          echo "TOTAL=${TOTAL}, CHUNK=${CHUNK}"
+          if [ "$CHUNK" -ge "$TOTAL" ]; then
+            echo "SKIP=true" >> $GITHUB_ENV
+          else
+            echo "OFFSET=${CHUNK}" >> $GITHUB_ENV
+            echo "MAX_TICKERS=1"   >> $GITHUB_ENV   # 1銘柄/シャード
+            echo "SKIP=false"      >> $GITHUB_ENV
+          fi
 
-      - name: Run scraper for this shard
+      # ★ ジッターで開始をバラす（アクセス集中を避ける）
+      - name: Stagger start a bit
+        if: env.SKIP == 'false'
+        run: |
+          S=$(( (RANDOM % 15) + 5 ))
+          echo "Sleeping ${S}s before start..."
+          sleep ${S}
+
+      - name: Run scraper (1 ticker in this shard)
+        if: env.SKIP == 'false'
         run: |
           python scraper.py
-          # このジョブの出力を shard毎にファイル名を変えて保存
           mv metrics.csv metrics_part_${{ matrix.chunk }}.csv
           head -n 5 metrics_part_${{ matrix.chunk }}.csv || true
 
       - name: Upload part artifact
+        if: env.SKIP == 'false'
         uses: actions/upload-artifact@v4
         with:
           name: part-${{ matrix.chunk }}
           path: metrics_part_${{ matrix.chunk }}.csv
           if-no-files-found: error
 
-  # ---- 部分CSVを結合して1本化 ----
   merge:
     needs: shard
     runs-on: ubuntu-latest
@@ -91,11 +114,10 @@ jobs:
       - name: Merge parts into metrics.csv
         run: |
           set -e
-          ls -R parts
-          # 先頭のヘッダは一回だけ。それ以外は2行目以降を連結
+          ls -R parts || true
           FIRST=true
           rm -f metrics.csv
-          for f in $(ls parts/**/metrics_part_*.csv | sort); do
+          for f in $(ls parts/**/metrics_part_*.csv 2>/dev/null | sort); do
             if $FIRST; then
               cat "$f" > metrics.csv
               FIRST=false
@@ -132,7 +154,6 @@ jobs:
         with:
           path: site
 
-  # ---- Pages へデプロイ ----
   deploy:
     needs: merge
     runs-on: ubuntu-latest
