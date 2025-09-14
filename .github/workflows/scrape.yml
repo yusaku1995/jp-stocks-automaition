@@ -13,28 +13,31 @@ permissions:
   id-token: write
 
 jobs:
-  # ---- 6並列で部分CSVを作る ----
+  # ---- 並列シャーディング ----
   shard:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     strategy:
       fail-fast: false
-      max-parallel: 1     # ★ シャードを直列実行に
+      # ▼まずは 3 並列で安定運用（様子を見て 2 or 4 に調整）
+      max-parallel: 3
+      # ▼シャード数（= PARTS）。124銘柄テストなら 12 が目安
       matrix:
-        chunk: [0, 1, 2, 3, 4, 5]   # ← 6分割（必要なら増減OK）
+        chunk: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+        PARTS: [12]
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Install deps
+
+      - name: Install lxml (XPath用)
         run: |
           python -m pip install --upgrade pip
           pip install lxml
 
-
-      - name: Upgrade pip & install deps
+      - name: Install requirements
         run: |
           python -m pip install --upgrade pip
           pip install --retries 5 --timeout 60 -r requirements.txt
@@ -50,10 +53,11 @@ jobs:
         id: cut
         run: |
           TOTAL=$(wc -l < tickers.txt)
-          PARTS=6
+          PARTS=${{ matrix.PARTS }}
+          # 端数切り上げで1シャード当たり件数を計算
           PER=$(( (TOTAL + PARTS - 1) / PARTS ))
           OFFSET=$(( ${{ matrix.chunk }} * PER ))
-          echo "TOTAL=${TOTAL}, PER=${PER}, OFFSET=${OFFSET}"
+          echo "TOTAL=${TOTAL}, PARTS=${PARTS}, PER=${PER}, OFFSET=${OFFSET}"
           echo "OFFSET=${OFFSET}" >> $GITHUB_ENV
           echo "MAX_TICKERS=${PER}" >> $GITHUB_ENV
 
@@ -102,37 +106,24 @@ jobs:
           echo "Merged CSV head:"
           head -n 10 metrics.csv
 
-      # リポジトリ直下にコミット（Sheetsのrawで読む用）
       - name: Commit metrics.csv to repo (safe rebase)
         run: |
           set -e
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          # 念のため現在のブランチ名を取得（通常は main）
           BRANCH="${GITHUB_REF_NAME:-main}"
           echo "Branch: $BRANCH"
-
-          # 最新を取り込み（rebase）して競合回避
           git fetch origin
           git checkout "$BRANCH"
           git pull --rebase origin "$BRANCH" || true
-
-          # metrics.csv があるか確認して追加
           test -f metrics.csv && git add -f metrics.csv || (echo "metrics.csv not found"; ls -la; exit 1)
-
           git commit -m "merge metrics [skip ci]" || echo "no changes"
-
-          # 安全に push（強制しない）
           git push origin HEAD:"$BRANCH" || {
             echo "Non fast-forward; retry with rebase once more..."
             git pull --rebase origin "$BRANCH"
             git push origin HEAD:"$BRANCH"
           }
 
-
-
-      # Pages のアーティファクトとしてアップロード
       - name: Prepare site dir
         run: mkdir -p site && cp metrics.csv site/
 
