@@ -250,7 +250,7 @@ def _num_pct_sane(s):
     except:
         return ""
 
-# ====== Kabutan ======
+# ====== Kabutan overview/finance quick getters ======
 def kabu_per(code):
     return _num_only(_get_first_text_by_xpath(
         KABU_OVERVIEW.format(code=code),
@@ -311,8 +311,36 @@ def kabu_credit(code):
         )
     return _num_only(t)
 
+# --- NEW: 自己資本比率を財務ページの数値から直接計算するフォールバック ---
+_EQUITY_LABELS = ["自己資本", "純資産", "株主資本"]
+_ASSETS_LABELS = ["総資産", "資産合計", "資産総額"]
+
+def _finance_pick_latest_number(url, label_keywords):
+    """
+    財務ページ内の表から、指定キーワードを含む行の『直近の数値』を拾う。
+    列が複数（年度・期）あっても、行テキストから出現順で最初の数値を採用。
+    """
+    try:
+        r = requests.get(url, headers=_headers(), timeout=25)
+        if r.status_code != 200 or not r.text:
+            print(f"[WARN] HTML HTTP {r.status_code}: {url}", flush=True)
+            return ""
+        doc = LH.fromstring(r.text)
+        # すべての行を走査
+        for tr in doc.xpath("//tr[td or th]"):
+            txt = " ".join([re.sub(r"\s+", " ", e.text_content().strip()) for e in tr.xpath("./th|./td")])
+            if any(k in txt for k in label_keywords):
+                # 行内の最初の実数値
+                m = re.search(r"(-?\d[\d,]*\.?\d*)", txt)
+                if m:
+                    return re.sub(r"[,\s]", "", m.group(1))
+        return ""
+    except Exception as e:
+        print(f"[ERR] finance parse {url} -> {e}", flush=True)
+        return ""
+
 def kabu_equity_ratio_pct(code):
-    """自己資本比率。XPath→HTML全文regex→DOMテキストregex→IRBANK→CSV算出の多段フォールバック。"""
+    """自己資本比率。XPath→HTML/DOM regex→IRBANK→CSV算出→財務の生数値計算（NEW）の多段フォールバック。"""
     url_f = KABU_FINANCE.format(code=code)
 
     # 1) XPath
@@ -335,7 +363,7 @@ def kabu_equity_ratio_pct(code):
             if v != "":
                 return v
 
-    # 3) Finance ページを DOM から text_content() で平文化してregex
+    # 3) Finance ページ DOM text_content() からregex
     dom_txt = _fetch_text_from_dom(url_f)
     if dom_txt:
         m = re.search(r"自己資本比率[^0-9\-]*(\-?\d+(?:\.\d+)?)\s*%", dom_txt)
@@ -344,44 +372,39 @@ def kabu_equity_ratio_pct(code):
             if v != "":
                 return v
 
-    # 4) 概要ページ（HTML→regex、DOM→regexも両方）
-    html_o = _fetch_text(KABU_OVERVIEW.format(code=code))
-    if html_o:
-        m = re.search(r"自己資本比率[^0-9\-]*(\-?\d+(?:\.\d+)?)\s*%", html_o)
-        if m:
-            v = _num_pct_sane(m.group(1))
-            if v != "":
-                return v
-    dom_o = _fetch_text_from_dom(KABU_OVERVIEW.format(code=code))
-    if dom_o:
-        m = re.search(r"自己資本比率[^0-9\-]*(\-?\d+(?:\.\d+)?)\s*%", dom_o)
-        if m:
-            v = _num_pct_sane(m.group(1))
-            if v != "":
-                return v
+    # 4) 概要ページ（HTML/DOM → regex）
+    for src in [KABU_OVERVIEW.format(code=code), IR_HTML.format(code=code)]:
+        raw = _fetch_text(src)
+        if raw:
+            m = re.search(r"自己資本比率[^0-9\-]*(\-?\d+(?:\.\d+)?)\s*%", raw)
+            if m:
+                v = _num_pct_sane(m.group(1)); 
+                if v != "": return v
+        dom = _fetch_text_from_dom(src)
+        if dom:
+            m = re.search(r"自己資本比率[^0-9\-]*(\-?\d+(?:\.\d+)?)\s*%", dom)
+            if m:
+                v = _num_pct_sane(m.group(1)); 
+                if v != "": return v
 
-    # 5) IRBANK HTML（regex/DOM両方）
-    html_ir = _fetch_text(IR_HTML.format(code=code))
-    if html_ir:
-        m = re.search(r"自己資本比率[^0-9\-]*(\-?\d+(?:\.\d+)?)\s*%", html_ir)
-        if m:
-            v = _num_pct_sane(m.group(1))
-            if v != "":
-                return v
-    dom_ir = _fetch_text_from_dom(IR_HTML.format(code=code))
-    if dom_ir:
-        m = re.search(r"自己資本比率[^0-9\-]*(\-?\d+(?:\.\d+)?)\s*%", dom_ir)
-        if m:
-            v = _num_pct_sane(m.group(1))
-            if v != "":
-                return v
-
-    # 6) IRBANK CSV算出（4桁のみ）
+    # 5) IRBANK CSV 算出（4桁のみ）
     eps, bps, ni, eq, assets, dps = fetch_eps_bps_profit_equity_assets_dps(code)
     if eq != "" and assets != "":
         ratio = safe_div(eq, assets)
         pct = to_pct(ratio) if ratio != "" else ""
-        return str(pct) if pct != "" else ""
+        if pct != "": 
+            return str(pct)
+
+    # 6) ★NEW: 財務ページの「自己資本」「総資産」を直接拾って比率計算
+    eq_txt  = _finance_pick_latest_number(url_f, _EQUITY_LABELS)
+    as_txt  = _finance_pick_latest_number(url_f, _ASSETS_LABELS)
+    if eq_txt != "" and as_txt != "":
+        try:
+            eq_val = float(eq_txt); as_val = float(as_txt)
+            if as_val != 0:
+                return str((eq_val / as_val) * 100.0)
+        except:
+            pass
 
     return ""
 
