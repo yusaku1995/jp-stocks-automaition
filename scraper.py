@@ -25,19 +25,30 @@ EQ_KEYS  = ["自己資本","株主資本","純資産"]
 AS_KEYS  = ["総資産","資産合計"]
 DPS_KEYS = ["1株配当","配当金","配当(円)","配当（円）"]
 
-
 def get_csv(code, path):
     url = IR_CSV.format(code=code, path=path)
     for i in range(RETRIES):
         try:
             r = requests.get(url, headers=HEADERS, timeout=20)
-            if r.ok and "\n" in r.text:
-                return list(csv.reader(io.StringIO(r.text)))
-        except Exception:
-            pass
-        time.sleep(2*(i+1))  # エクスポネンシャル風バックオフ
+            ctype = r.headers.get("Content-Type","")
+            # HTML等が返ってきたら弾く（高負荷時の制限ページなど）
+            if not r.ok:
+                print(f"[WARN] {url} -> HTTP {r.status_code}", flush=True)
+            elif "text/csv" not in ctype and "application/octet-stream" not in ctype:
+                preview = (r.text or "")[:200].replace("\n"," ")
+                print(f"[WARN] {url} -> non-CSV ({ctype}). head='{preview}'", flush=True)
+            else:
+                rows = list(csv.reader(io.StringIO(r.text)))
+                if len(rows) >= 2:
+                    print(f"[OK] {url} rows={len(rows)}", flush=True)
+                    return rows
+                else:
+                    print(f"[WARN] {url} -> CSV but too short", flush=True)
+        except Exception as e:
+            print(f"[ERR] {url} -> {e}", flush=True)
+        time.sleep(2*(i+1))  # 少しずつ待ち時間を増やす
+    print(f"[FAIL] {url} retried {RETRIES}x", flush=True)
     return None
-
 
 def col_index(header_row, keys):
     # find first header that matches any of keys (exact or contains)
@@ -102,8 +113,8 @@ def stooq_close_vols(code):
     url = STOOQ.format(code=code)
     for i in range(3):
         try:
-            r = requests.get(url, headers=HEADERS, timeout=25)
-            if r.status_code == 200:
+            r = requests.get(url, headers=HEADERS, timeout=15)
+            if r.status_code == 200 and "\n" in r.text:
                 lines = [x.split(',') for x in r.text.strip().splitlines()]
                 if len(lines) >= 2:
                     rows = lines[1:]
@@ -112,19 +123,23 @@ def stooq_close_vols(code):
                     for x in reversed(rows):
                         if len(x) >= 6:
                             try:
-                                close = float(x[4])
-                                break
-                            except:
-                                pass
+                                close = float(x[4]); break
+                            except: pass
+                    print(f"[OK] {url} days={len(rows)} close={close}", flush=True)
                     vol5 = vol25 = vratio = ""
                     if len(vols) >= 25:
                         vol5  = int(sum(vols[-5:]) / 5)
                         vol25 = int(sum(vols[-25:]) / 25)
                         vratio = (vol5/vol25) if vol25 else ""
                     return close, vol5, vol25, vratio
-        except Exception:
-            pass
+                else:
+                    print(f"[WARN] {url} no rows", flush=True)
+            else:
+                print(f"[WARN] {url} HTTP {r.status_code}", flush=True)
+        except Exception as e:
+            print(f"[ERR] {url} -> {e}", flush=True)
         time.sleep(1 + i)
+    print(f"[FAIL] {url}", flush=True)
     return None, "", "", ""
 
 def fetch_credit_ratio(code):
@@ -161,7 +176,6 @@ def main():
     with open("tickers.txt", "r", encoding="utf-8") as f:
         codes = [line.strip() for line in f if line.strip()]
 
-    # 並列分割用：環境変数 OFFSET / MAX_TICKERS に対応
     offset = int(os.getenv("OFFSET", "0"))
     limit  = int(os.getenv("MAX_TICKERS", "0"))
     if limit > 0:
@@ -169,12 +183,39 @@ def main():
 
     total = len(codes)
     print(f"Total tickers to process in this shard: {total}", flush=True)
-    
+
     out = []
     for i, code in enumerate(codes, 1):
-        print(f"[{i}/{len(codes)}] {code}")
+        print(f"[{i}/{total}] {code} start", flush=True)
         close, vol5, vol25, vratio = stooq_close_vols(code)
-        eps, bps, netinc, equity, assets, dps = fetch_eps_bps_profit_equity_assets_dps(code)
+
+        eps = bps = netinc = equity = assets = dps = ""
+        pl = get_csv(code, CSV_PL)
+        bs = get_csv(code, CSV_BS)
+        dv = get_csv(code, CSV_DIV)
+        if pl:
+            h = pl[0]
+            eps_idx = col_index(h, EPS_KEYS)
+            ni_idx  = col_index(h, NI_KEYS)
+            eps = last_num(pl, eps_idx)
+            netinc = last_num(pl, ni_idx)
+        if bs:
+            h = bs[0]
+            bps_idx = col_index(h, BPS_KEYS)
+            eq_idx  = col_index(h, EQ_KEYS)
+            as_idx  = col_index(h, AS_KEYS)
+            bps = last_num(bs, bps_idx)
+            equity = last_num(bs, eq_idx)
+            assets = last_num(bs, as_idx)
+        if dv:
+            h = dv[0]
+            dps_idx = col_index(h, DPS_KEYS)
+            dps = last_num(dv, dps_idx)
+
+        # 1件目だけDEBUG詳細
+        if i == 1:
+            print(f"[DEBUG] {code} eps={eps} bps={bps} ni={netinc} eq={equity} as={assets} dps={dps}", flush=True)
+
         per = safe_div(close, eps) if (close is not None) else ""
         pbr = safe_div(close, bps) if (close is not None) else ""
         roe = safe_div(netinc, equity)
@@ -183,17 +224,21 @@ def main():
         eq_ratio_pct = to_pct(eq_ratio) if eq_ratio != "" else ""
         dy = safe_div(dps, close) if (dps and close not in (None,"")) else ""
         dy_pct = to_pct(dy) if dy != "" else ""
-        op_yoy = fetch_opinc_yoy(code)
-        credit = fetch_credit_ratio(code)
+
+        op_yoy = fetch_opinc_yoy(code)  # ここも get_csv() を通るのでOK/FAILが出ます
+        credit = fetch_credit_ratio(code)  # これはHTML→正規表現
+
         out.append([code, close if close is not None else "", per, pbr, roe_pct, eq_ratio_pct,
                     dy_pct, op_yoy, credit, vol5, vol25, vratio])
-        time.sleep(1)  # politeness
+        time.sleep(0.4)
+
     with open("metrics.csv", "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(["code","close","per","pbr","roe_pct","equity_ratio_pct",
                     "dividend_yield_pct","op_income_yoy_pct","credit_ratio",
                     "vol5","vol25","volratio_5_25"])
         w.writerows(out)
+    print("metrics.csv written", flush=True)
 
 if __name__ == "__main__":
     main()
