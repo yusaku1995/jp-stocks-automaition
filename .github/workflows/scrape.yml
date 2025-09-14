@@ -3,6 +3,10 @@ on:
   schedule: [{cron: "15 9 * * 1-5"}]   # 平日18:15 JST
   workflow_dispatch: {}
 
+concurrency:
+  group: data-publish-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
   contents: write     # metrics.csv をコミット
   pages: write        # Pages へ公開
@@ -94,13 +98,34 @@ jobs:
           head -n 10 metrics.csv
 
       # リポジトリ直下にコミット（Sheetsのrawで読む用）
-      - name: Commit metrics.csv to repo
+      - name: Commit metrics.csv to repo (safe rebase)
         run: |
+          set -e
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add metrics.csv
-          git commit -m "merge metrics" || echo "no changes"
-          git push
+
+          # 念のため現在のブランチ名を取得（通常は main）
+          BRANCH="${GITHUB_REF_NAME:-main}"
+          echo "Branch: $BRANCH"
+
+          # 最新を取り込み（rebase）して競合回避
+          git fetch origin
+          git checkout "$BRANCH"
+          git pull --rebase origin "$BRANCH" || true
+
+          # metrics.csv があるか確認して追加
+          test -f metrics.csv && git add -f metrics.csv || (echo "metrics.csv not found"; ls -la; exit 1)
+
+          git commit -m "merge metrics [skip ci]" || echo "no changes"
+
+          # 安全に push（強制しない）
+          git push origin HEAD:"$BRANCH" || {
+            echo "Non fast-forward; retry with rebase once more..."
+            git pull --rebase origin "$BRANCH"
+            git push origin HEAD:"$BRANCH"
+          }
+
+
 
       # Pages のアーティファクトとしてアップロード
       - name: Prepare site dir
