@@ -23,7 +23,7 @@ RETRIES = 6
 # ====== Endpoints ======
 IR_CSV  = "https://f.irbank.net/files/{code}/{path}"               # CSVは4桁数字で安定（英字は多くが無い）
 IR_HTML = "https://irbank.net/{code}"                               # HTMLは英字付きも可（フォールバックに使用）
-STOOQ   = "https://stooq.com/q/d/l/?s={code}.jp&i=d"               # ★英字付きでもユーザー環境で取れていた想定でそのまま使用
+STOOQ   = "https://stooq.com/q/d/l/?s={code}.jp&i=d"               # 英字付きもそのまま投げる
 KABU_OVERVIEW = "https://kabutan.jp/stock/?code={code}"
 KABU_FINANCE  = "https://kabutan.jp/stock/finance?code={code}"
 KABU_KABUKA   = "https://kabutan.jp/stock/kabuka?code={code}&ashi=day&page={page}"
@@ -99,7 +99,7 @@ def last_num_in_row(rows, ridx):
         return ""
     r = rows[ridx]
     for x in reversed(r[1:]):
-        if x is None: 
+        if x is None:
             continue
         s = str(x).replace(',', '').strip()
         if s in ("", "-", "—", "–", "―"):
@@ -206,6 +206,20 @@ def _get_first_text_by_xpath(url, xp):
         polite_sleep(1.5 + i)
     return ""
 
+def _fetch_text(url):
+    """ページ全文テキスト（HTMLそのもの）を返す。失敗時は空文字。"""
+    for i in range(3):
+        try:
+            r = requests.get(url, headers=_headers(), timeout=25)
+            if r.status_code == 200 and r.text:
+                return r.text
+            else:
+                print(f"[WARN] HTML HTTP {r.status_code}: {url}", flush=True)
+        except Exception as e:
+            print(f"[ERR] HTML fetch {url} -> {e}", flush=True)
+        polite_sleep(1.0 + i)
+    return ""
+
 def _num_only(s):
     if not s:
         return ""
@@ -289,34 +303,55 @@ def kabu_credit(code):
     return _num_only(t)
 
 def kabu_equity_ratio_pct(code):
-    url = KABU_FINANCE.format(code=code)
+    """自己資本比率。まずXPath、ダメならページ全文を正規表現で強制抽出、さらにIRBANKにもフォールバック。"""
+    url_f = KABU_FINANCE.format(code=code)
+
+    # 1) XPathで探す
     for xp in [
         "//th[.//text()[contains(.,'自己資本比率')]]/following-sibling::td[1]",
         "//*[contains(text(),'自己資本比率')]/following::td[1]",
         "//*[contains(text(),'自己資本比率')]/ancestor::*[self::tr or self::li][1]/*[self::td or self::dd][1]",
     ]:
-        t = _get_first_text_by_xpath(url, xp)
+        t = _get_first_text_by_xpath(url_f, xp)
         v = _num_pct_sane(t)
         if v != "":
             return v
-    # 概要ページ側
-    t = _get_first_text_by_xpath(KABU_OVERVIEW.format(code=code), "//*[contains(text(),'自己資本比率')][1]/following::text()[1]")
-    v = _num_pct_sane(t)
-    if v != "":
-        return v
-    # IRBANK fallback（テキスト直取り）
-    txt = _get_first_text_by_xpath(IR_HTML.format(code=code), "//*[contains(text(),'自己資本比率')][1]/following::text()[1]")
-    if txt == "":
-        # ページにより位置が違うことがあるので全文から正規表現で
-        try:
-            r = requests.get(IR_HTML.format(code=code), headers=_headers(), timeout=20)
-            if r.status_code == 200 and r.text:
-                m = re.search(r"自己資本比率[^0-9\-]*(\-?\d+(?:\.\d+)?)\s*%", r.text)
-                if m:
-                    return _num_pct_sane(m.group(1))
-        except Exception:
-            pass
-    return _num_pct_sane(txt)
+
+    # 2) Financeページ全文から正規表現で％抜き
+    html_txt = _fetch_text(url_f)
+    if html_txt:
+        m = re.search(r"自己資本比率[^0-9\-]*(\-?\d+(?:\.\d+)?)\s*%", html_txt)
+        if m:
+            v = _num_pct_sane(m.group(1))
+            if v != "":
+                return v
+
+    # 3) 概要ページにもたまに出る
+    html_o = _fetch_text(KABU_OVERVIEW.format(code=code))
+    if html_o:
+        m = re.search(r"自己資本比率[^0-9\-]*(\-?\d+(?:\.\d+)?)\s*%", html_o)
+        if m:
+            v = _num_pct_sane(m.group(1))
+            if v != "":
+                return v
+
+    # 4) IRBANK HTML（テキスト検索）
+    html_ir = _fetch_text(IR_HTML.format(code=code))
+    if html_ir:
+        m = re.search(r"自己資本比率[^0-9\-]*(\-?\d+(?:\.\d+)?)\s*%", html_ir)
+        if m:
+            v = _num_pct_sane(m.group(1))
+            if v != "":
+                return v
+
+    # 5) IRBANK CSVからの算出（eq/assets が取れた場合）
+    eps, bps, ni, eq, assets, dps = fetch_eps_bps_profit_equity_assets_dps(code)
+    if eq != "" and assets != "":
+        ratio = safe_div(eq, assets)
+        pct = to_pct(ratio) if ratio != "" else ""
+        return str(pct) if pct != "" else ""
+
+    return ""
 
 def ir_pbr(code):
     return _num_only(_get_first_text_by_xpath(IR_HTML.format(code=code), "(//*[contains(text(),'PBR')])[1]/following::text()[1]"))
