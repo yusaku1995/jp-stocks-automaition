@@ -169,40 +169,27 @@ def fetch_eps_bps_profit_equity_assets_dps(code):
 # ===== op_income_yoy フォールバック追加 =====
 
 def _extract_yoy_from_text(url):
-    """
-    ページ本文から 「営業利益(営業益) ×(前年同期比|前年比|前比) ±NN.N%」 を拾う。
-    DOMのtext_content()でscript/styleを除去してから正規表現検索。
-    見つかった最初の値を返す。
-    """
     try:
         r = requests.get(url, headers=_headers(), timeout=25)
         if r.status_code != 200 or not r.text:
             print(f"[WARN] HTML HTTP {r.status_code}: {url}", flush=True)
             return ""
         doc = LH.fromstring(r.text)
-        text = doc.text_content()  # 可視テキスト
+        text = doc.text_content()
         text = re.sub(r"\s+", " ", text)
-
-        # 例：
-        # 「営業利益 前年同期比 +12.3%」「営業益 前年比 -8.0%」「営業利益 前比 5.1%」
         m = re.search(
             r"(営業利益|営業益)\s*.*?(前年同期比|前年比|前比)\s*[:：]?\s*([+\-]?\d+(?:\.\d+)?)\s*%",
             text
         )
         if m:
-            return m.group(3)  # パーセント数値部分
+            return m.group(3)
     except Exception as e:
         print(f"[ERR] yoy parse {url} -> {e}", flush=True)
     return ""
 
 
 def fetch_opinc_yoy(code):
-    """
-    営業利益の前年比(%)
-    1) IRBANK CSV (qq-yoy-operating-income.csv) が取れればそれを使用
-    2) 取れなければ Kabutan 財務ページから % を抽出（複数候補のXPath＋正規表現）
-    """
-    # ---- 1) IRBANK CSV（成功すれば最優先） ----
+    # 1) IRBANK CSV
     qq = get_csv(code, CSV_QQ)
     if qq:
         for row in reversed(qq[1:]):
@@ -213,7 +200,7 @@ def fetch_opinc_yoy(code):
                 continue
             return s
 
-    # ---- 2) Kabutan 財務ページのHTMLをパースして前年比%を抽出 ----
+    # 2) Kabutan 財務ページから近傍%抽出
     url = KABU_FINANCE.format(code=code)
 
     def _get_text(url, xp):
@@ -233,33 +220,22 @@ def fetch_opinc_yoy(code):
         except Exception:
             return ""
 
-    # 候補1: 「営業利益」行の同一行・近傍にある % を拾う
-    #   - テーブル構造が変わっても取れるように、行全体テキストから % を探す
     candidates = [
-        # 行テキスト全体
         "//tr[.//*[contains(normalize-space(.),'営業利益')]]",
-        # dl定義リスト風の可能性（保険）
         "//*[self::tr or self::li][.//*[contains(normalize-space(.),'営業利益')]]",
     ]
-
     pct_re = re.compile(r"([+\-]?\d+(?:\.\d+)?)\s*%")
     for xp in candidates:
         row_txt = _get_text(url, xp)
         if row_txt:
-            # “前年比/前年同期比/前比”が近くにある % を優先的に抜く
-            near_re = re.compile(
-                r"(前年同期比|前年比|前比)[^%]{0,40}?([+\-]?\d+(?:\.\d+)?)\s*%"
-            )
+            near_re = re.compile(r"(前年同期比|前年比|前比)[^%]{0,40}?([+\-]?\d+(?:\.\d+)?)\s*%")
             m = near_re.search(row_txt)
             if m:
                 return m.group(2)
-
-            # 近接ヒットが無ければ、行中に出現する最初の % を採用（最後の保険）
             m2 = pct_re.search(row_txt)
             if m2:
                 return m2.group(1)
 
-    # 概要ページ側にも稀に % が出る可能性に保険をかける
     overview_txt = _get_text(KABU_OVERVIEW.format(code=code), "//*[contains(text(),'営業利益')]/ancestor::*[self::tr or self::li][1]")
     if overview_txt:
         m = re.search(r"(前年同期比|前年比|前比)[^%]{0,40}?([+\-]?\d+(?:\.\d+)?)\s*%", overview_txt)
@@ -269,23 +245,15 @@ def fetch_opinc_yoy(code):
         if m2:
             return m2.group(1)
 
-    # どうしても取れない場合は空
-    return ""
-
-
-    # 2) Kabutan 側（財務・概要の両方を試す）
+    # 3) その他フォールバック
     for url in (KABU_FINANCE.format(code=code), KABU_OVERVIEW.format(code=code)):
         v = _extract_yoy_from_text(url)
         if v != "":
             return v
-
-    # 3) IRBANK 側（HTML本文）
     v = _extract_yoy_from_text(IR_HTML.format(code=code))
     if v != "":
         return v
-
     return ""
-
 
 # ====== HTML helpers ======
 _num_re = re.compile(r"(-?\d+(?:\.\d+)?)")
@@ -327,7 +295,6 @@ def _fetch_text(url):
     return ""
 
 def _fetch_text_from_dom(url):
-    """DOM化→text_content()で可視テキストを抽出（script/style等を除去）。"""
     for i in range(3):
         try:
             r = requests.get(url, headers=_headers(), timeout=25)
@@ -419,45 +386,8 @@ def kabu_credit(code):
         )
     return _num_only(t)
 
-# --- NEW: 自己資本比率を財務ページの数値から直接計算するフォールバック ---
-_EQUITY_LABELS = ["自己資本", "純資産", "株主資本"]
-_ASSETS_LABELS = ["総資産", "資産合計", "資産総額"]
-
-def _finance_pick_latest_number(url, label_keywords):
-    """
-    財務ページ内の表から、指定キーワードを含む行の『直近の数値』を拾う。
-    列が複数（年度・期）あっても、行テキストから出現順で最初の数値を採用。
-    """
-    try:
-        r = requests.get(url, headers=_headers(), timeout=25)
-        if r.status_code != 200 or not r.text:
-            print(f"[WARN] HTML HTTP {r.status_code}: {url}", flush=True)
-            return ""
-        doc = LH.fromstring(r.text)
-        # すべての行を走査
-        for tr in doc.xpath("//tr[td or th]"):
-            txt = " ".join([re.sub(r"\s+", " ", e.text_content().strip()) for e in tr.xpath("./th|./td")])
-            if any(k in txt for k in label_keywords):
-                # 行内の最初の実数値
-                m = re.search(r"(-?\d[\d,]*\.?\d*)", txt)
-                if m:
-                    return re.sub(r"[,\s]", "", m.group(1))
-        return ""
-    except Exception as e:
-        print(f"[ERR] finance parse {url} -> {e}", flush=True)
-        return ""
-
+# --- 自己資本比率：多段フォールバック ---
 def kabu_equity_ratio_pct(code):
-    """
-    自己資本比率(%)を取得。
-    1) 株探 財務ページの複数XPath
-    2) 株探 概要ページの複数XPath
-    3) 株探 財務/概要のページ全文 正規表現
-    4) IRBANK HTMLの複数XPath
-    5) IRBANK HTML 全文 正規表現
-    の順で探索し、最初に見つかった%値を返す。
-    見つからなければ空文字。
-    """
     def _try_xpaths(url, xps):
         for xp in xps:
             t = _get_first_text_by_xpath(url, xp)
@@ -470,7 +400,6 @@ def kabu_equity_ratio_pct(code):
         try:
             r = requests.get(url, headers=_headers(), timeout=25)
             if r.status_code == 200 and r.text:
-                # 「自己資本比率」から近傍(最長80文字)に出る数値% を拾う
                 m = re.search(r"自己資本比率[^%]{0,80}?([+\-]?\d+(?:\.\d+)?)\s*%", r.text)
                 if m:
                     return _num_pct_sane(m.group(1))
@@ -478,7 +407,6 @@ def kabu_equity_ratio_pct(code):
             pass
         return ""
 
-    # 1) 株探 財務
     url_f = KABU_FINANCE.format(code=code)
     xps_f = [
         "//tr[.//*[contains(normalize-space(.),'自己資本比率')]]/*[self::td or self::th][last()]",
@@ -491,7 +419,6 @@ def kabu_equity_ratio_pct(code):
     if v != "":
         return v
 
-    # 2) 株探 概要
     url_o = KABU_OVERVIEW.format(code=code)
     xps_o = [
         "//*[contains(text(),'自己資本比率')][1]/following::text()[1]",
@@ -501,7 +428,6 @@ def kabu_equity_ratio_pct(code):
     if v != "":
         return v
 
-    # 3) 株探 全文 正規表現（財務→概要の順）
     v = _try_regex(url_f)
     if v != "":
         return v
@@ -509,7 +435,6 @@ def kabu_equity_ratio_pct(code):
     if v != "":
         return v
 
-    # 4) IRBANK HTML
     url_ir = IR_HTML.format(code=code)
     xps_ir = [
         "(//*[contains(text(),'自己資本比率')])[1]/following::text()[1]",
@@ -519,14 +444,11 @@ def kabu_equity_ratio_pct(code):
     if v != "":
         return v
 
-    # 5) IRBANK 全文 正規表現
     v = _try_regex(url_ir)
     if v != "":
         return v
 
     return ""
-
-
 
 def ir_pbr(code):
     return _num_only(_get_first_text_by_xpath(IR_HTML.format(code=code), "(//*[contains(text(),'PBR')])[1]/following::text()[1]"))
@@ -581,7 +503,7 @@ def kabutan_vols_any(code):
                         tds = [re.sub(r"\s+", " ", td.text_content().strip()) for td in tr.xpath("./td")]
                         if len(tds) < 6:
                             continue
-                        vtxt = tds[-1]
+                        vtxt = tds[-1]  # 最終列=出来高
                         vnum = re.sub(r"[^\d]", "", vtxt)
                         if vnum != "":
                             vols.append(int(vnum))
@@ -606,6 +528,91 @@ def get_vols(code):
     if v5 == "" or v25 == "":
         v5, v25, vr = kabutan_vols_any(code)
     return v5, v25, vr
+
+# ====== 25MA 乖離率（Stooq優先 → 株探フォールバック） ======
+def stooq_closes_any(code):
+    """StooqのCSVから終値列(第5列)を時系列リストで取得。最新は末尾。"""
+    url = STOOQ.format(code=code)
+    for i in range(3):
+        try:
+            r = requests.get(url, headers=_headers(), timeout=15)
+            if r.status_code == 200 and "\n" in r.text:
+                rows = [x.split(',') for x in r.text.strip().splitlines()][1:]
+                closes = []
+                for x in rows:
+                    if len(x) >= 5:
+                        try:
+                            closes.append(float(x[4]))
+                        except:
+                            pass
+                if closes:
+                    return closes
+            else:
+                print(f"[WARN] {url} HTTP {r.status_code}", flush=True)
+        except Exception as e:
+            print(f"[ERR] {url} -> {e}", flush=True)
+        polite_sleep(1 + i)
+    return []
+
+def kabutan_closes_any(code):
+    """株探『過去の株価』の表から終値列を集める（最新が先頭行の想定）。"""
+    closes = []
+    page = 1
+    while len(closes) < 25 and page <= 5:
+        url = KABU_KABUKA.format(code=code, page=page)
+        try:
+            r = requests.get(url, headers=_headers(), timeout=25)
+            if r.status_code == 200 and r.text:
+                doc = LH.fromstring(r.text)
+                tables = doc.xpath("//table[contains(@class,'stock_kabuka') or contains(@class,'kabuka')]")
+                found = False
+                for tb in tables:
+                    rows = tb.xpath(".//tr[td]")
+                    for tr in rows:
+                        tds = [re.sub(r"\s+", " ", td.text_content().strip()) for td in tr.xpath("./td")]
+                        # 想定: 日付/始値/高値/安値/終値/出来高 などで6列以上
+                        if len(tds) >= 5:
+                            ctxt = tds[-2]  # 終値は後ろから2番目が多い
+                            cnum = re.sub(r"[^\d.\-]", "", ctxt)
+                            if cnum not in ("", "-", "."):
+                                try:
+                                    closes.append(float(cnum))
+                                    found = True
+                                except:
+                                    pass
+                if not found:
+                    print(f"[WARN] Kabutan closes: table not parsed on page {page} for {code}", flush=True)
+            else:
+                print(f"[WARN] HTML HTTP {r.status_code}: {url}", flush=True)
+        except Exception as e:
+            print(f"[ERR] Kabutan closes fetch {url} -> {e}", flush=True)
+        page += 1
+        polite_sleep(1.0)
+    # 株探は最新が先頭に来ることが多いので、このままの並びでOK（最新が index 0）
+    # Stooqの closes は末尾が最新なので、後で整合取る
+    return closes  # 先頭が最新の想定
+
+def calc_deviation_25ma(code):
+    """
+    25MA乖離率[%] = (直近終値 / 直近25日終値平均 - 1) * 100
+    Stooqで25本取れなければ、株探の『過去の株価』でフォールバック。
+    """
+    closes = stooq_closes_any(code)
+    if len(closes) >= 25:
+        last = closes[-1]               # Stooqは末尾が最新
+        ma25 = sum(closes[-25:]) / 25.0
+        if ma25 > 0:
+            return str(round((last / ma25 - 1.0) * 100.0, 4))
+        return ""
+    # フォールバック：株探（先頭が最新の想定）
+    closes = kabutan_closes_any(code)
+    if len(closes) >= 25:
+        last = closes[0]                # 株探は先頭が最新の想定
+        ma25 = sum(closes[:25]) / 25.0
+        if ma25 > 0:
+            return str(round((last / ma25 - 1.0) * 100.0, 4))
+        return ""
+    return ""
 
 # ====== Main ======
 def main():
@@ -648,15 +655,19 @@ def main():
         divy_pct = kabu_divy_pct(code)
         credit   = kabu_credit(code) or ir_credit(code) or ""
 
+        # 25MA 乖離率（%）
+        dev25_pct = calc_deviation_25ma(code)
+
         if i == 1:
-            print(f"[DEBUG] {code} per={per} pbr={pbr} roe%={roe_pct} eqr%={eqr_pct} divy%={divy_pct} credit={credit} v5={vol5} v25={vol25} vr={vratio}", flush=True)
+            print(f"[DEBUG] {code} per={per} pbr={pbr} roe%={roe_pct} eqr%={eqr_pct} divy%={divy_pct} credit={credit} v5={vol5} v25={vol25} vr={vratio} dev25%={dev25_pct}", flush=True)
 
         op_yoy = fetch_opinc_yoy(code)
 
         out.append([
             code,
             per, pbr, roe_pct, eqr_pct, divy_pct,
-            op_yoy, credit, vol5, vol25, vratio
+            op_yoy, credit, vol5, vol25, vratio,
+            dev25_pct
         ])
         polite_sleep(0.6)
 
@@ -665,7 +676,8 @@ def main():
         w.writerow([
             "code","per","pbr","roe_pct","equity_ratio_pct",
             "dividend_yield_pct","op_income_yoy_pct","credit_ratio",
-            "vol5","vol25","volratio_5_25"
+            "vol5","vol25","volratio_5_25",
+            "deviation_25ma_pct"
         ])
         w.writerows(out)
     print("metrics.csv written", flush=True)
