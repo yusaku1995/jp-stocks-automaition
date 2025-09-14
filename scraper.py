@@ -198,19 +198,80 @@ def _extract_yoy_from_text(url):
 
 def fetch_opinc_yoy(code):
     """
-    1) IRBANK CSV (4桁コード) を試す
-    2) ダメなら Kabutan finance/overview の本文から '営業利益 前年同期比(前年比/前比) %' を拾う
-    3) さらにダメなら IRBANK HTML 本文から同様に拾う
+    営業利益の前年比(%)
+    1) IRBANK CSV (qq-yoy-operating-income.csv) が取れればそれを使用
+    2) 取れなければ Kabutan 財務ページから % を抽出（複数候補のXPath＋正規表現）
     """
-    # 1) 既存：IRBANK CSV
+    # ---- 1) IRBANK CSV（成功すれば最優先） ----
     qq = get_csv(code, CSV_QQ)
     if qq:
         for row in reversed(qq[1:]):
             if len(row) <= 1:
                 continue
             s = re.sub(r'[^0-9.\-]', '', row[1] or "")
-            if s not in ("", "-", ".", "-."):
-                return s
+            if s in ("", "-", ".", "-."):
+                continue
+            return s
+
+    # ---- 2) Kabutan 財務ページのHTMLをパースして前年比%を抽出 ----
+    url = KABU_FINANCE.format(code=code)
+
+    def _get_text(url, xp):
+        try:
+            r = requests.get(url, headers=_headers(), timeout=25)
+            if r.status_code != 200 or not r.text:
+                return ""
+            doc = LH.fromstring(r.text)
+            nodes = doc.xpath(xp)
+            if not nodes:
+                return ""
+            parts = []
+            for n in nodes:
+                parts.append(n if isinstance(n, str) else n.text_content())
+            text = " ".join(parts).strip()
+            return re.sub(r"\s+", " ", text)
+        except Exception:
+            return ""
+
+    # 候補1: 「営業利益」行の同一行・近傍にある % を拾う
+    #   - テーブル構造が変わっても取れるように、行全体テキストから % を探す
+    candidates = [
+        # 行テキスト全体
+        "//tr[.//*[contains(normalize-space(.),'営業利益')]]",
+        # dl定義リスト風の可能性（保険）
+        "//*[self::tr or self::li][.//*[contains(normalize-space(.),'営業利益')]]",
+    ]
+
+    pct_re = re.compile(r"([+\-]?\d+(?:\.\d+)?)\s*%")
+    for xp in candidates:
+        row_txt = _get_text(url, xp)
+        if row_txt:
+            # “前年比/前年同期比/前比”が近くにある % を優先的に抜く
+            near_re = re.compile(
+                r"(前年同期比|前年比|前比)[^%]{0,40}?([+\-]?\d+(?:\.\d+)?)\s*%"
+            )
+            m = near_re.search(row_txt)
+            if m:
+                return m.group(2)
+
+            # 近接ヒットが無ければ、行中に出現する最初の % を採用（最後の保険）
+            m2 = pct_re.search(row_txt)
+            if m2:
+                return m2.group(1)
+
+    # 概要ページ側にも稀に % が出る可能性に保険をかける
+    overview_txt = _get_text(KABU_OVERVIEW.format(code=code), "//*[contains(text(),'営業利益')]/ancestor::*[self::tr or self::li][1]")
+    if overview_txt:
+        m = re.search(r"(前年同期比|前年比|前比)[^%]{0,40}?([+\-]?\d+(?:\.\d+)?)\s*%", overview_txt)
+        if m:
+            return m.group(2)
+        m2 = pct_re.search(overview_txt)
+        if m2:
+            return m2.group(1)
+
+    # どうしても取れない場合は空
+    return ""
+
 
     # 2) Kabutan 側（財務・概要の両方を試す）
     for url in (KABU_FINANCE.format(code=code), KABU_OVERVIEW.format(code=code)):
@@ -387,73 +448,78 @@ def _finance_pick_latest_number(url, label_keywords):
         return ""
 
 def kabu_equity_ratio_pct(code):
-    """自己資本比率。XPath→HTML/DOM regex→IRBANK→CSV算出→財務の生数値計算（NEW）の多段フォールバック。"""
+    """
+    株探→（取れなければ）IRBANKの順で自己資本比率(%)を抽出。
+    ・表記ゆれ（連結/単体/国内・国際基準）に対応
+    ・table/ul/dl など構造差異に強いXPathを複数用意
+    ・%の異常値(±1000%)は無効化
+    ・見つからなければ空文字
+    """
+    def _fetch(url, xps):
+        for xp in xps:
+            t = _get_first_text_by_xpath(url, xp)
+            v = _num_pct_sane(t)
+            if v != "":
+                return v
+        return ""
+
+    # ---------- 1) 株探（財務） ----------
     url_f = KABU_FINANCE.format(code=code)
-
-    # 1) XPath
-    for xp in [
-        "//th[.//text()[contains(.,'自己資本比率')]]/following-sibling::td[1]",
+    # 「自己資本比率」を含む行・定義リストを幅広く拾う
+    kabu_xps = [
+        # テーブル系
+        "//tr[.//*[contains(normalize-space(.),'自己資本比率')]]/*[self::td or self::th][last()]",
+        "//th[contains(.,'自己資本比率')]/following-sibling::td[1]",
         "//*[contains(text(),'自己資本比率')]/following::td[1]",
-        "//*[contains(text(),'自己資本比率')]/ancestor::*[self::tr or self::li][1]/*[self::td or self::dd][1]",
-    ]:
-        t = _get_first_text_by_xpath(url_f, xp)
-        v = _num_pct_sane(t)
-        if v != "":
-            return v
+        # 定義リスト/その他
+        "//*[contains(text(),'自己資本比率')]/ancestor::*[self::tr or self::li or self::dl or self::div][1]/*[self::td or self::dd][1]",
+        # 連結/単体などのバリエーションも拾う
+        "//*[contains(normalize-space(.),'自己資本比率') and (contains(.,'連結') or contains(.,'単体') or contains(.,'国内') or contains(.,'国際'))]/following::*[self::td or self::dd][1]"
+    ]
+    v = _fetch(url_f, kabu_xps)
+    if v != "":
+        return v
 
-    # 2) Finance ページ HTML生テキストからregex
-    html_txt = _fetch_text(url_f)
-    if html_txt:
-        m = re.search(r"自己資本比率[^0-9\-]*(\-?\d+(?:\.\d+)?)\s*%", html_txt)
-        if m:
-            v = _num_pct_sane(m.group(1))
-            if v != "":
-                return v
+    # 概要ページ側に出るケースの保険
+    url_o = KABU_OVERVIEW.format(code=code)
+    kabu_overview_xps = [
+        "//*[contains(text(),'自己資本比率')][1]/following::text()[1]",
+        "//*[contains(text(),'自己資本比率')]/ancestor::*[self::tr or self::li][1]/*[self::td or self::dd][1]"
+    ]
+    v = _fetch(url_o, kabu_overview_xps)
+    if v != "":
+        return v
 
-    # 3) Finance ページ DOM text_content() からregex
-    dom_txt = _fetch_text_from_dom(url_f)
-    if dom_txt:
-        m = re.search(r"自己資本比率[^0-9\-]*(\-?\d+(?:\.\d+)?)\s*%", dom_txt)
-        if m:
-            v = _num_pct_sane(m.group(1))
-            if v != "":
-                return v
+    # ---------- 2) IRBANK（HTMLフォールバック） ----------
+    url_ir = IR_HTML.format(code=code)
+    irbank_xps = [
+        "(//*[contains(text(),'自己資本比率')])[1]/following::text()[1]",
+        "//*[contains(text(),'自己資本比率')]/ancestor::*[self::tr or self::li or self::dl or self::div][1]/*[self::td or self::dd][1]"
+    ]
+    v = _fetch(url_ir, irbank_xps)
+    if v != "":
+        return v
 
-    # 4) 概要ページ（HTML/DOM → regex）
-    for src in [KABU_OVERVIEW.format(code=code), IR_HTML.format(code=code)]:
-        raw = _fetch_text(src)
-        if raw:
-            m = re.search(r"自己資本比率[^0-9\-]*(\-?\d+(?:\.\d+)?)\s*%", raw)
+    # ---------- 3) 最終保険：ページ全文から正規表現 ----------
+    try:
+        r = requests.get(url_f, headers=_headers(), timeout=25)
+        if r.status_code == 200 and r.text:
+            m = re.search(r"自己資本比率[^%]{0,80}?([+\-]?\d+(?:\.\d+)?)\s*%", r.text)
             if m:
-                v = _num_pct_sane(m.group(1)); 
-                if v != "": return v
-        dom = _fetch_text_from_dom(src)
-        if dom:
-            m = re.search(r"自己資本比率[^0-9\-]*(\-?\d+(?:\.\d+)?)\s*%", dom)
+                return _num_pct_sane(m.group(1))
+    except Exception:
+        pass
+    try:
+        r = requests.get(url_ir, headers=_headers(), timeout=25)
+        if r.status_code == 200 and r.text:
+            m = re.search(r"自己資本比率[^%]{0,80}?([+\-]?\d+(?:\.\d+)?)\s*%", r.text)
             if m:
-                v = _num_pct_sane(m.group(1)); 
-                if v != "": return v
-
-    # 5) IRBANK CSV 算出（4桁のみ）
-    eps, bps, ni, eq, assets, dps = fetch_eps_bps_profit_equity_assets_dps(code)
-    if eq != "" and assets != "":
-        ratio = safe_div(eq, assets)
-        pct = to_pct(ratio) if ratio != "" else ""
-        if pct != "": 
-            return str(pct)
-
-    # 6) ★NEW: 財務ページの「自己資本」「総資産」を直接拾って比率計算
-    eq_txt  = _finance_pick_latest_number(url_f, _EQUITY_LABELS)
-    as_txt  = _finance_pick_latest_number(url_f, _ASSETS_LABELS)
-    if eq_txt != "" and as_txt != "":
-        try:
-            eq_val = float(eq_txt); as_val = float(as_txt)
-            if as_val != 0:
-                return str((eq_val / as_val) * 100.0)
-        except:
-            pass
+                return _num_pct_sane(m.group(1))
+    except Exception:
+        pass
 
     return ""
+
 
 def ir_pbr(code):
     return _num_only(_get_first_text_by_xpath(IR_HTML.format(code=code), "(//*[contains(text(),'PBR')])[1]/following::text()[1]"))
