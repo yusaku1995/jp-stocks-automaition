@@ -1,7 +1,13 @@
 # -*- coding: utf-8 -*-
-# jp-stocks-automation scraper (Kabutan/IRBANK + XPath, uses codes exactly as given; supports 215A 等)
-import os, io, csv, re, time, random, requests
-from lxml import html as LH  # XPath 用
+# jp-stocks-automation scraper
+# 取得するもの：
+#  - PER / PBR / ROE% / 自己資本比率% / 配当利回り% / 営業利益YoY% / 信用倍率
+#  - 出来高(5日平均, 25日平均, 比率)
+# 価格(終値)は出力しません。ティッカーは英字付き(例: 215A)もそのまま扱います。
+
+import os, io, csv, re, time, random, requests, math
+from datetime import datetime, timedelta, timezone
+from lxml import html as LH  # XPath
 
 # ========= 基本設定 =========
 UA_POOL = [
@@ -18,39 +24,53 @@ def _headers():
     }
 
 RETRIES = 6
+SLEEP_BASE = 0.6
 
-# 取得元（コードは“そのまま”使う）
+# 取得元（コードは“そのまま”使う：英字付きも可）
 IR_CSV = "https://f.irbank.net/files/{code}/{path}"
 IR_HTML= "https://irbank.net/{code}"
-STOOQ  = "https://stooq.com/q/d/l/?s={code}.jp&i=d"
 KABU_OVERVIEW = "https://kabutan.jp/stock/?code={code}"
 KABU_FINANCE  = "https://kabutan.jp/stock/finance?code={code}"
+STOOQ  = "https://stooq.com/q/d/l/?s={code}.jp&i=d"  # 失敗したらYahooにフォールバック
+YF_CSV = "https://query1.finance.yahoo.com/v7/finance/download/{symbol}?period1={p1}&period2={p2}&interval=1d&events=history&includeAdjustedClose=true"
 
-# IRBANK CSVパス
-CSV_PL="fy-profit-and-loss.csv"
-CSV_BS="fy-balance-sheet.csv"
-CSV_DIV="fy-stock-dividend.csv"
+# IRBANK CSV（営業利益YoYのみ使用）
 CSV_QQ="qq-yoy-operating-income.csv"
-CSV_PS="fy-per-share.csv"
 
-# ========= ユーティリティ =========
+# ========= 小物 =========
 def polite_sleep(sec: float) -> None:
-    time.sleep(sec + random.uniform(0.1, 0.6))
+    time.sleep(sec + random.uniform(0.1, 0.5))
 
-def safe_div(a, b):
-    try:
-        a = float(a); b = float(b)
-        if b == 0:
-            return ""
-        return a / b
-    except:
-        return ""
+_num_re = re.compile(r"(-?\d+(?:\.\d+)?)")
 
-def to_pct(x):
-    try:
-        return float(x) * 100.0
-    except:
+def _get_first_text_by_xpath(url, xp):
+    for i in range(3):
+        try:
+            r = requests.get(url, headers=_headers(), timeout=25)
+            if r.status_code == 200 and r.text:
+                doc = LH.fromstring(r.text)
+                nodes = doc.xpath(xp)
+                if nodes:
+                    parts = []
+                    for n in nodes:
+                        parts.append(n if isinstance(n, str) else n.text_content())
+                    text = " ".join(parts).strip()
+                    text = re.sub(r"\s+", " ", text)
+                    return text
+                else:
+                    print(f"[WARN] XPath no match: {url} :: {xp}", flush=True)
+            else:
+                print(f"[WARN] HTML HTTP {r.status_code}: {url}", flush=True)
+        except Exception as e:
+            print(f"[ERR] HTML fetch {url} -> {e}", flush=True)
+        polite_sleep(1.0 + i*0.7)
+    return ""
+
+def _num_only(s):
+    if not s:
         return ""
+    m = _num_re.search(s)
+    return m.group(1) if m else ""
 
 def normalize_code_line(line: str) -> str:
     token = re.split(r"[\s,\t]+", line.strip())[0] if line else ""
@@ -61,55 +81,7 @@ def normalize_code_line(line: str) -> str:
         pass
     return token.strip().upper()
 
-# ========= IRBANK CSV 用：見出しマッチ支援 =========
-def _norm_label(s):
-    if s is None:
-        return ""
-    s = str(s)
-    s = re.sub(r'（.*?）', '', s)
-    s = re.sub(r'\(.*?\)',  '', s)
-    s = re.sub(r'[\s　,/％%円¥\-–—]', '', s)
-    return s
-
-EPS_KEYS=["EPS","EPS(円)","EPS（円）","1株当たり利益","1株当たり当期純利益","1株当たり当期純利益(円)","1株当たり当期純利益（円）","1株当たり純利益"]
-BPS_KEYS=["BPS","BPS(円)","BPS（円）","1株当たり純資産","1株当たり純資産(円)","1株当たり純資産（円）","1株純資産"]
-DPS_KEYS=["1株配当","1株配当金","配当金","配当(円)","配当（円）","1株当たり配当金"]
-EQ_KEYS =["自己資本","自己資本合計","株主資本","株主資本合計","純資産","純資産合計"]
-AS_KEYS =["総資産","資産合計","資産総額"]
-NI_KEYS =["当期純利益","親会社株主に帰属する当期純利益","純利益"]
-
-def row_index_by_keys(rows, keys):
-    if not rows:
-        return None
-    norm_keys = [_norm_label(k) for k in keys]
-    for i, r in enumerate(rows):
-        if not r:
-            continue
-        head = _norm_label(r[0])
-        if not head:
-            continue
-        for nk in norm_keys:
-            if nk and (nk in head or head in nk):
-                return i
-    return None
-
-def last_num_in_row(rows, ridx):
-    if ridx is None:
-        return ""
-    r = rows[ridx]
-    for x in reversed(r[1:]):
-        if x is None: 
-            continue
-        s = str(x).replace(',', '').strip()
-        if s in ("", "-", "—", "–", "―"):
-            continue
-        try:
-            return float(s)
-        except:
-            continue
-    return ""
-
-# ========= IRBANK CSV 取得（入力コードを“そのまま”使う）=========
+# ========= IRBANK CSV（営業利益YoY）=========
 def get_csv(code, path):
     url = IR_CSV.format(code=code, path=path)
     for i in range(RETRIES):
@@ -125,43 +97,15 @@ def get_csv(code, path):
                 rows = list(csv.reader(io.StringIO(r.text)))
                 if len(rows) >= 2:
                     print(f"[OK] {url} rows={len(rows)}", flush=True)
-                    polite_sleep(1.5)
+                    polite_sleep(0.8)
                     return rows
                 else:
                     print(f"[WARN] {url} CSV too short", flush=True)
         except Exception as e:
             print(f"[ERR] {url} -> {e}", flush=True)
-        polite_sleep(2 + 2*i)
+        polite_sleep(1.0 + 0.8*i)
     print(f"[FAIL] {url} retried {RETRIES}x", flush=True)
     return None
-
-def fetch_eps_bps_profit_equity_assets_dps(code):
-    pl = get_csv(code, CSV_PL)
-    bs = get_csv(code, CSV_BS)
-    dv = get_csv(code, CSV_DIV)
-    ps = get_csv(code, CSV_PS)
-
-    eps = bps = ni = eq = assets = dps = ""
-
-    if pl:
-        eps = last_num_in_row(pl, row_index_by_keys(pl, EPS_KEYS))
-        ni  = last_num_in_row(pl, row_index_by_keys(pl, NI_KEYS))
-    if eps == "" and ps:
-        eps = last_num_in_row(ps, row_index_by_keys(ps, EPS_KEYS))
-
-    if bs:
-        bps    = last_num_in_row(bs, row_index_by_keys(bs, BPS_KEYS))
-        eq     = last_num_in_row(bs, row_index_by_keys(bs, EQ_KEYS))
-        assets = last_num_in_row(bs, row_index_by_keys(bs, AS_KEYS))
-    if bps == "" and ps:
-        bps = last_num_in_row(ps, row_index_by_keys(ps, BPS_KEYS))
-
-    if dv:
-        dps = last_num_in_row(dv, row_index_by_keys(dv, DPS_KEYS))
-    if dps == "" and ps:
-        dps = last_num_in_row(ps, row_index_by_keys(ps, DPS_KEYS))
-
-    return eps, bps, ni, eq, assets, dps
 
 def fetch_opinc_yoy(code):
     qq = get_csv(code, CSV_QQ)
@@ -170,128 +114,234 @@ def fetch_opinc_yoy(code):
     for row in reversed(qq[1:]):
         if len(row) <= 1:
             continue
-        s = re.sub(r'[^0-9.\-]', '', row[1] or "")
+        s = re.sub(r'[^0-9.\-]', '', (row[1] or ""))
         if s in ("", "-", ".", "-."):
             continue
         return s
     return ""
 
-# ========= Stooq（日足・出来高）=========
-def stooq_close_vols(code):
-    """
-    入力コードを“そのまま”使う（215A など英字付きは Stooq 側で失敗し得る）。
-    失敗しても後段で Kabutan から close を補完するのでOK。
-    """
+# ========= Kabutan/IRBANK（HTML, XPath）=========
+def kabu_per(code):
+    url = KABU_OVERVIEW.format(code=code)
+    xps = [
+        "//th[contains(.,'PER')]/following-sibling::td[1]",
+        "//*[contains(normalize-space(.),'PER')]/following::*[1]",
+    ]
+    for xp in xps:
+        v = _num_only(_get_first_text_by_xpath(url, xp))
+        if v != "": return v
+    return ""
+
+def kabu_pbr(code):
+    url = KABU_OVERVIEW.format(code=code)
+    xps = [
+        "//th[contains(.,'PBR')]/following-sibling::td[1]",
+        "//*[contains(normalize-space(.),'PBR')]/following::*[1]",
+    ]
+    for xp in xps:
+        v = _num_only(_get_first_text_by_xpath(url, xp))
+        if v != "": return v
+    # IRBANK保険
+    return _num_only(_get_first_text_by_xpath(
+        IR_HTML.format(code=code), "(//*[contains(text(),'PBR')])[1]/following::text()[1]"
+    ))
+
+def kabu_roe_pct(code):
+    url = KABU_OVERVIEW.format(code=code)
+    xps = [
+        "//th[.//text()[contains(.,'ROE')]]/following-sibling::td[1]",
+        "//*[self::th or self::*][contains(normalize-space(.),'ROE')]/following::*[1]",
+        "//*[contains(text(),'ROE')][1]/following::text()[1]",
+    ]
+    for xp in xps:
+        v = _num_only(_get_first_text_by_xpath(url, xp))
+        if v != "": return v
+    url_f = KABU_FINANCE.format(code=code)
+    xps_f = [
+        "//th[.//text()[contains(.,'ROE')]]/following-sibling::td[1]",
+        "//*[contains(text(),'ROE')]/following::td[1]",
+    ]
+    for xp in xps_f:
+        v = _num_only(_get_first_text_by_xpath(url_f, xp))
+        if v != "": return v
+    return _num_only(_get_first_text_by_xpath(
+        IR_HTML.format(code=code), "(//*[contains(text(),'ROE')])[1]/following::text()[1]"
+    ))
+
+def kabu_divy_pct(code):
+    url = KABU_OVERVIEW.format(code=code)
+    xps = [
+        "//th[.//text()[contains(.,'配当利回り')]]/following-sibling::td[1]",
+        "//*[self::th or self::*][contains(normalize-space(.),'配当利回り')]/following::*[1]",
+        "//*[contains(text(),'配当利回り')][1]/following::text()[1]",
+    ]
+    for xp in xps:
+        v = _num_only(_get_first_text_by_xpath(url, xp))
+        if v != "": return v
+    return _num_only(_get_first_text_by_xpath(
+        IR_HTML.format(code=code), "(//*[contains(text(),'配当利回り')])[1]/following::text()[1]"
+    ))
+
+def kabu_credit(code):
+    url = KABU_OVERVIEW.format(code=code)
+    xps = [
+        "//*[contains(text(),'信用倍率')][1]/following::text()[1]",
+        "//th[contains(.,'信用倍率')]/following-sibling::td[1]",
+        "//dt[contains(.,'信用倍率')]/following-sibling::dd[1]",
+    ]
+    for xp in xps:
+        v = _num_only(_get_first_text_by_xpath(url, xp))
+        if v != "": return v
+    return _num_only(_get_first_text_by_xpath(
+        IR_HTML.format(code=code), "(//*[contains(text(),'信用倍率')])[1]/following::text()[1]"
+    ))
+
+def kabu_equity_ratio_pct(code):
+    url = KABU_FINANCE.format(code=code)
+    xps = [
+        "//th[.//text()[contains(.,'自己資本比率')]]/following-sibling::td[1]",
+        "//*[contains(text(),'自己資本比率')]/following::td[1]",
+        "//*[contains(text(),'自己資本比率')]/ancestor::*[self::tr or self::li][1]/*[self::td or self::dd][1]",
+        "//dt[contains(.,'自己資本比率')]/following-sibling::dd[1]",
+    ]
+    for xp in xps:
+        v = _num_only(_get_first_text_by_xpath(url, xp))
+        if v != "": return v
+    # 概要ページ側の保険
+    url_o = KABU_OVERVIEW.format(code=code)
+    v = _num_only(_get_first_text_by_xpath(url_o, "//*[contains(text(),'自己資本比率')][1]/following::text()[1]"))
+    if v != "": return v
+    # IRBANK保険
+    return _num_only(_get_first_text_by_xpath(
+        IR_HTML.format(code=code), "(//*[contains(text(),'自己資本比率')])[1]/following::text()[1]"
+    ))
+
+# ========= 出来高（Stooq -> Yahoo CSV フォールバック）=========
+def _vol_5_25(vols):
+    vols = [int(v) for v in vols if isinstance(v, (int, float, str)) and str(v).isdigit()]
+    if len(vols) < 5:
+        return "", "", ""
+    v5 = int(sum(vols[-5:]) / 5)
+    v25 = int(sum(vols[-25:]) / 25) if len(vols) >= 25 else ""
+    ratio = (v5 / v25) if (isinstance(v25, int) and v25 != 0) else ""
+    return v5, v25, ratio
+
+def fetch_volumes_stooq(code):
     url = STOOQ.format(code=code)
     for i in range(3):
         try:
-            r = requests.get(url, headers=_headers(), timeout=15)
+            r = requests.get(url, headers=_headers(), timeout=12)
             if r.status_code == 200 and "\n" in r.text:
                 rows = [x.split(',') for x in r.text.strip().splitlines()][1:]
-                if not rows:
-                    break
-                close = None
-                for x in reversed(rows):
-                    if len(x) >= 5:
-                        try:
-                            close = float(x[4]); break
-                        except:
-                            pass
                 vols = []
                 for x in rows:
                     if len(x) >= 6:
                         try:
                             vols.append(int(x[5]))
                         except:
-                            vols.append(0)
-                print(f"[OK] {url} days={len(rows)} close={close}", flush=True)
-                vol5 = vol25 = vratio = ""
-                if len(vols) >= 25:
-                    vol5  = int(sum(vols[-5:]) / 5)
-                    vol25 = int(sum(vols[-25:]) / 25)
-                    vratio = (vol5/vol25) if vol25 else ""
-                return close, vol5, vol25, vratio
+                            pass
+                if vols:
+                    print(f"[OK] Stooq vols {code}: days={len(vols)}", flush=True)
+                    return _vol_5_25(vols)
             else:
-                print(f"[WARN] {url} HTTP {r.status_code}", flush=True)
+                print(f"[WARN] Stooq HTTP {r.status_code}: {url}", flush=True)
         except Exception as e:
-            print(f"[ERR] {url} -> {e}", flush=True)
-        polite_sleep(1 + i)
-    print(f"[FAIL] {url}", flush=True)
-    return None, "", "", ""
+            print(f"[ERR] Stooq {code} -> {e}", flush=True)
+        polite_sleep(0.8 + i*0.6)
+    return "", "", ""
 
-# ========= HTML + XPath（Sheets と同等の抽出）=========
-_num_re = re.compile(r"(-?\d+(?:\.\d+)?)")
-
-def _get_first_text_by_xpath(url, xp):
+def fetch_volumes_yahoo(code):
+    # Yahooは {code}.T を試す（英字付きもそのまま）
+    symbol = f"{code}.T"
+    # 直近200日分をDL
+    tz = timezone.utc
+    p2 = int(datetime.now(tz=tz).timestamp())
+    p1 = int((datetime.now(tz=tz) - timedelta(days=220)).timestamp())
+    url = YF_CSV.format(symbol=symbol, p1=p1, p2=p2)
     for i in range(3):
         try:
-            r = requests.get(url, headers=_headers(), timeout=25)
-            if r.status_code == 200 and r.text:
-                doc = LH.fromstring(r.text)
-                nodes = doc.xpath(xp)
-                if nodes:
-                    parts = []
-                    for n in nodes:
-                        if isinstance(n, str):
-                            parts.append(n)
-                        else:
-                            parts.append(n.text_content())
-                    text = " ".join(parts).strip()
-                    text = re.sub(r"\s+", " ", text)
-                    return text
-                else:
-                    print(f"[WARN] XPath no match: {url} :: {xp}", flush=True)
+            r = requests.get(url, headers=_headers(), timeout=20)
+            if r.status_code == 200 and "Date,Open,High,Low,Close" in r.text:
+                rows = list(csv.reader(io.StringIO(r.text)))
+                hdr = rows[0]
+                try:
+                    idx_vol = hdr.index("Volume")
+                except ValueError:
+                    print(f"[WARN] Yahoo CSV no Volume col: {symbol}", flush=True)
+                    return "", "", ""
+                vols = []
+                for row in rows[1:]:
+                    if len(row) > idx_vol:
+                        s = row[idx_vol].strip()
+                        if s and s.isdigit():
+                            vols.append(int(s))
+                if vols:
+                    print(f"[OK] Yahoo vols {symbol}: days={len(vols)}", flush=True)
+                    return _vol_5_25(vols)
             else:
-                print(f"[WARN] HTML HTTP {r.status_code}: {url}", flush=True)
+                print(f"[WARN] Yahoo HTTP {r.status_code}: {symbol}", flush=True)
         except Exception as e:
-            print(f"[ERR] HTML fetch {url} -> {e}", flush=True)
-        polite_sleep(1.5 + i)
-    return ""
+            print(f"[ERR] Yahoo {symbol} -> {e}", flush=True)
+        polite_sleep(0.9 + i*0.6)
+    return "", "", ""
 
-def _num_only(s):
-    if not s:
-        return ""
-    m = _num_re.search(s)
-    return m.group(1) if m else ""
+def fetch_volumes(code):
+    v5, v25, vr = fetch_volumes_stooq(code)
+    if v5 == "" or v25 == "":
+        v5b, v25b, vrb = fetch_volumes_yahoo(code)
+        v5 = v5 if v5 != "" else v5b
+        v25 = v25 if v25 != "" else v25b
+        vr = vr if vr != "" else vrb
+    return v5, v25, vr
 
-# Kabutan overview（PER/PBR/ROE/配当利回り/信用倍率/現在値）
-def kabu_per(code):
-    return _num_only(_get_first_text_by_xpath(
-        KABU_OVERVIEW.format(code=code),
-        "//th[contains(.,'PER')]/following-sibling::td[1]"
-    ))
+# ========= メイン =========
+def main():
+    with open("tickers.txt", "r", encoding="utf-8") as f:
+        raw = [line for line in f if line.strip()]
+    codes = [normalize_code_line(x) for x in raw]
+    # 記号だけ除去して重複削除（フォーマット制限なし）
+    codes = [re.sub(r"[^\w]", "", c) for c in codes]
+    filtered = list(dict.fromkeys(codes))
 
-def kabu_pbr(code):
-    return _num_only(_get_first_text_by_xpath(
-        KABU_OVERVIEW.format(code=code),
-        "//th[contains(.,'PBR')]/following-sibling::td[1]"
-    ))
+    # シャーディング
+    offset = int(os.getenv("OFFSET", "0"))
+    limit  = int(os.getenv("MAX_TICKERS", "0"))
+    if limit > 0:
+        filtered = filtered[offset:offset+limit]
 
-def kabu_roe_pct(code):
-    url = KABU_OVERVIEW.format(code=code)
-    candidates = [
-        "//th[.//text()[contains(.,'ROE')]]/following-sibling::td[1]",
-        "//*[self::th or self::*][contains(normalize-space(.),'ROE')]/following::*[1]",
-        "//*[contains(text(),'ROE')][1]/following::text()[1]",
-    ]
-    for xp in candidates:
-        t = _get_first_text_by_xpath(url, xp)
-        v = _num_only(t)
-        if v != "":
-            return v
-    url_f = KABU_FINANCE.format(code=code)
-    candidates_f = [
-        "//th[.//text()[contains(.,'ROE')]]/following-sibling::td[1]",
-        "//*[contains(text(),'ROE')]/following::td[1]",
-    ]
-    for xp in candidates_f:
-        t = _get_first_text_by_xpath(url_f, xp)
-        v = _num_only(t)
-        if v != "":
-            return v
-    url_ir = IR_HTML.format(code=code)
-    t = _get_first_text_by_xpath(url_ir, "(//*[contains(text(),'ROE')])[1]/following::text()[1]")
-    return _num_only(t)
+    print(f"Total tickers to process in this shard: {len(filtered)}", flush=True)
 
-def kabu_divy_pct(code):
-    u
+    out = []
+    for i, code in enumerate(filtered, 1):
+        print(f"[{i}/{len(filtered)}] {code} start", flush=True)
+
+        # 指標（HTML）
+        per   = kabu_per(code) or ""
+        pbr   = kabu_pbr(code) or ""
+        roe_p = kabu_roe_pct(code) or ""
+        eq_p  = kabu_equity_ratio_pct(code) or ""
+        dy_p  = kabu_divy_pct(code) or ""
+        cr    = kabu_credit(code) or ""
+        opy   = fetch_opinc_yoy(code)  # 取れなければ空
+
+        # 出来高
+        v5, v25, vr = fetch_volumes(code)
+
+        if i == 1:
+            print(f"[DEBUG] {code} per={per} pbr={pbr} roe%={roe_p} eqr%={eq_p} divy%={dy_p} credit={cr} op_yoy={opy} v5={v5} v25={v25} vr={vr}", flush=True)
+
+        out.append([code, per, pbr, roe_p, eq_p, dy_p, opy, cr, v5, v25, vr])
+        polite_sleep(SLEEP_BASE)
+
+    with open("metrics.csv", "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow([
+            "code","per","pbr","roe_pct","equity_ratio_pct",
+            "dividend_yield_pct","op_income_yoy_pct","credit_ratio",
+            "vol5","vol25","volratio_5_25"
+        ])
+        w.writerows(out)
+    print("metrics.csv written", flush=True)
+
+if __name__ == "__main__":
+    main()
