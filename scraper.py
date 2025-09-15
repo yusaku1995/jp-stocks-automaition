@@ -386,7 +386,41 @@ def kabu_credit(code):
         )
     return _num_only(t)
 
-# --- 自己資本比率：多段フォールバック ---
+# === 追加: 株探の財務表から行マッチ → 最新数値を取る ===
+def _kabu_pick_latest_number(url, label_keywords):
+    """
+    株探/財務ページの表(<tr>)を総なめし、見出しに label_keywords のいずれかを含む行を探す。
+    その行の '左から最初に現れる数値' を返す（株探は左が直近のことが多い）。
+    単位は比率計算では相殺されるため、そのままfloat化でOK。
+    """
+    try:
+        r = requests.get(url, headers=_headers(), timeout=25)
+        if r.status_code != 200 or not r.text:
+            print(f"[WARN] HTML HTTP {r.status_code}: {url}", flush=True)
+            return ""
+        doc = LH.fromstring(r.text)
+
+        # 表の行を順番にスキャン
+        for tr in doc.xpath("//tr[td or th]"):
+            cells = tr.xpath("./th|./td")
+            txt_all = " ".join(re.sub(r"\s+", " ", c.text_content().strip()) for c in cells)
+            if not any(k in txt_all for k in label_keywords):
+                continue
+
+            # 行の中の「左から最初の数値」を拾う（直近を想定）
+            for c in cells:
+                s = re.sub(r"[^\d\.\-]", "", c.text_content())
+                if s not in ("", "-", ".", "-."):
+                    try:
+                        return float(s)
+                    except:
+                        pass
+        return ""
+    except Exception as e:
+        print(f"[ERR] _kabu_pick_latest_number {url} -> {e}", flush=True)
+        return ""
+
+# --- 置換版: 自己資本比率（%） 多段フォールバック + 計算 ---
 def kabu_equity_ratio_pct(code):
     def _try_xpaths(url, xps):
         for xp in xps:
@@ -406,6 +440,64 @@ def kabu_equity_ratio_pct(code):
         except Exception:
             pass
         return ""
+
+    # 1) 株探 財務ページ: 直接%を拾う
+    url_f = KABU_FINANCE.format(code=code)
+    xps_f = [
+        "//tr[.//*[contains(normalize-space(.),'自己資本比率')]]/*[self::td or self::th][1]",
+        "//th[contains(.,'自己資本比率')]/following-sibling::td[1]",
+        "//*[contains(text(),'自己資本比率')]/following::td[1]",
+        "//*[contains(text(),'自己資本比率')]/ancestor::*[self::tr or self::li or self::dl or self::div][1]/*[self::td or self::dd][1]",
+    ]
+    v = _try_xpaths(url_f, xps_f)
+    if v != "":
+        return v
+
+    # 2) 株探 概要ページ
+    url_o = KABU_OVERVIEW.format(code=code)
+    xps_o = [
+        "//*[contains(text(),'自己資本比率')][1]/following::text()[1]",
+        "//*[contains(text(),'自己資本比率')]/ancestor::*[self::tr or self::li][1]/*[self::td or self::dd][1]"
+    ]
+    v = _try_xpaths(url_o, xps_o)
+    if v != "":
+        return v
+
+    # 3) 正規表現（財務→概要）
+    v = _try_regex(url_f)
+    if v != "":
+        return v
+    v = _try_regex(url_o)
+    if v != "":
+        return v
+
+    # 4) “計算”フォールバック：株探 財務ページから 自己資本/総資産 を拾って比率化
+    equity = _kabu_pick_latest_number(url_f, ["自己資本", "純資産", "株主資本"])
+    assets = _kabu_pick_latest_number(url_f, ["総資産", "資産合計", "資産総額"])
+    if equity != "" and assets not in ("", 0):
+        try:
+            ratio = float(equity) / float(assets) * 100.0
+            # 異常値弾き
+            if 0 <= ratio <= 1000:
+                return str(round(ratio, 2))
+        except:
+            pass
+
+    # 5) IRBANK HTML でも一応トライ（軽め）
+    url_ir = IR_HTML.format(code=code)
+    xps_ir = [
+        "(//*[contains(text(),'自己資本比率')])[1]/following::text()[1]",
+        "//*[contains(text(),'自己資本比率')]/ancestor::*[self::tr or self::li or self::dl or self::div][1]/*[self::td or self::dd][1]"
+    ]
+    v = _try_xpaths(url_ir, xps_ir)
+    if v != "":
+        return v
+    v = _try_regex(url_ir)
+    if v != "":
+        return v
+
+    return ""
+
 
     url_f = KABU_FINANCE.format(code=code)
     xps_f = [
