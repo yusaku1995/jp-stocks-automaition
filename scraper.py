@@ -403,7 +403,7 @@ def _kabu_pick_latest_number(url, label_keywords):
     """
     株探/財務ページの表(<tr>)を走査し、
     見出しに label_keywords のいずれかを含む行から
-    '項目名セルを除いた数値セルのうち、左端の値' を返す。
+    項目名セルを除いた数値セルのうち、左端の値を返す。
     """
     try:
         r = requests.get(url, headers=_headers(), timeout=25)
@@ -421,7 +421,7 @@ def _kabu_pick_latest_number(url, label_keywords):
             if not any(k in txt_all for k in label_keywords):
                 continue
 
-            # 先頭セルは項目名であることが多いので除外して見る
+            # 先頭セルは項目名のことが多いので除外
             data_cells = cells[1:] if len(cells) >= 2 else cells
 
             for c in data_cells:
@@ -429,7 +429,7 @@ def _kabu_pick_latest_number(url, label_keywords):
                 if s not in ("", "-", ".", "-."):
                     try:
                         return float(s)
-                    except:
+                    except Exception:
                         pass
 
         return ""
@@ -498,6 +498,7 @@ def kabu_equity_ratio_pct(code):
             assets = float(assets)
             if assets > 0:
                 ratio = equity / assets * 100.0
+                # 自己資本比率として不自然な値を弾く
                 if 0 <= ratio <= 100:
                     return str(round(ratio, 2))
         except Exception:
@@ -691,7 +692,7 @@ def get_vols(code):
 
 # ====== 25MA 乖離率（Stooq優先 → 株探フォールバック） ======
 def stooq_closes_any(code):
-    """StooqのCSVから終値列(第5列)を時系列リストで取得。最新は末尾。"""
+    """StooqのCSVから終値列を取得。怪しい系列は捨てる。"""
     url = STOOQ.format(code=code)
     for i in range(3):
         try:
@@ -705,7 +706,18 @@ def stooq_closes_any(code):
                             closes.append(float(x[4]))
                         except:
                             pass
+
                 if closes:
+                    # 妥当性チェック:
+                    # 終値なら通常は大半が正の値で、極端に小さい値の並びにはなりにくい
+                    positive_count = sum(1 for v in closes if v > 0)
+                    max_abs = max(abs(v) for v in closes) if closes else 0
+
+                    # 明らかに終値系列としておかしい場合は捨てる
+                    if positive_count < max(5, len(closes) // 2) or max_abs < 50:
+                        print(f"[WARN] Stooq closes look invalid for {code}: closes={closes[:10]}...", flush=True)
+                        return []
+
                     return closes
             else:
                 print(f"[WARN] {url} HTTP {r.status_code}", flush=True)
@@ -732,7 +744,6 @@ def kabutan_closes_any(code):
                     if not rows:
                         continue
 
-                    # 1行目をヘッダーとして見て、終値列の位置を特定
                     header_cells = rows[0].xpath("./th|./td")
                     headers = [re.sub(r"\s+", " ", c.text_content().strip()) for c in header_cells]
 
@@ -757,7 +768,7 @@ def kabutan_closes_any(code):
                             try:
                                 closes.append(float(cnum))
                                 found = True
-                            except:
+                            except Exception:
                                 pass
 
                 if not found:
@@ -769,32 +780,41 @@ def kabutan_closes_any(code):
         page += 1
         polite_sleep(1.0)
 
-    # 株探は最新が先頭に来る想定
     return closes
 
 def calc_deviation_25ma(code):
     """
     25MA乖離率[%] = (直近終値 / 直近25日終値平均 - 1) * 100
-    Stooqで25本取れなければ、株探の『過去の株価』でフォールバック。
+    まずStooqを試し、怪しければ株探へフォールバック。
     """
     closes = stooq_closes_any(code)
     if len(closes) >= 25:
         recent_25 = closes[-25:]   # Stooqは末尾が最新
         last = recent_25[-1]
         ma25 = sum(recent_25) / 25.0
+
+        print(f"[DEBUG-25MA] {code} source=stooq last={last} ma25={ma25} closes={recent_25}", flush=True)
+
         if ma25 > 0:
-            return str(round((last / ma25 - 1.0) * 100.0, 4))
-        return ""
+            dev = (last / ma25 - 1.0) * 100.0
+            # 異常値ガード
+            if -80 <= dev <= 80:
+                return str(round(dev, 4))
+            print(f"[WARN] 25MA deviation looks abnormal for {code} from stooq: {dev}", flush=True)
 
     closes = kabutan_closes_any(code)
     if len(closes) >= 25:
         recent_25 = closes[:25]    # 株探は先頭が最新
         last = recent_25[0]
         ma25 = sum(recent_25) / 25.0
-        print(f"[DEBUG-25MA] {code} source=stooq last={last} ma25={ma25} closes={recent_25}", flush=True)
+
+        print(f"[DEBUG-25MA] {code} source=kabutan last={last} ma25={ma25} closes={recent_25}", flush=True)
+
         if ma25 > 0:
-            return str(round((last / ma25 - 1.0) * 100.0, 4))
-        return ""
+            dev = (last / ma25 - 1.0) * 100.0
+            if -80 <= dev <= 80:
+                return str(round(dev, 4))
+            print(f"[WARN] 25MA deviation looks abnormal for {code} from kabutan: {dev}", flush=True)
 
     return ""
 
