@@ -522,14 +522,9 @@ def jquants_equity_ratio_pct(code):
     return ""
 
 def kabutan_equity_ratio_from_finance_table(code):
-    print(f"[DEBUG-EQR-FUNC] using NEW kabutan_equity_ratio_from_finance_table for {code}", flush=True)
     """
     株探 finance ページ下部の『財務 〖実績〗』表から、
     最新行の自己資本比率を取得する。
-
-    例:
-      単 2024.10   93.47 34.2 26,575 9,078 1,902 1.26 24/12/12
-      連 2025.10  144.74 43.2 33,609 14,519 7,213 0.82 25/12/11
     """
     url = KABU_FINANCE.format(code=code)
     try:
@@ -540,89 +535,50 @@ def kabutan_equity_ratio_from_finance_table(code):
 
         doc = LH.fromstring(r.text)
         text = doc.text_content()
-        text = re.sub(r"\r", "\n", text)
+        text = re.sub(r"\s+", " ", text)
 
-        # 行単位で扱う
-        lines = [re.sub(r"\s+", " ", ln).strip() for ln in text.split("\n")]
-        lines = [ln for ln in lines if ln]
-
-        # 「財務 〖実績〗」以降を見る
-        start_idx = None
-        for i, ln in enumerate(lines):
-            if "財務" in ln and "実績" in ln:
-                start_idx = i
-                break
-
-        if start_idx is None:
-            print(f"[WARN] finance section not found: {url}", flush=True)
+        # 「財務 〖実績〗」ブロックを切り出す
+        m = re.search(
+            r"### 財務 .*? 実績.*?"
+            r"決算期 .*? 発表日 "
+            r"(.*?) "
+            r"※単位について",
+            text
+        )
+        if not m:
+            print(f"[WARN] finance block not found: {url}", flush=True)
             return ""
 
-        latest_row = ""
+        block = m.group(1)
 
-        # データ行:
-        # 単 2023.10*
-        # 単 2024.10
-        # 連 2025.10
-        row_pat = re.compile(r"^(単|連|U|I)\s+\d{4}\.\d{2}\*?$")
+        # データ行を全部拾う
+        # 例:
+        # 単 2023.10* -15,600.00 34.7 17,800 6,182 -894 1.32 -
+        # 単 2024.10 93.47 34.2 26,575 9,078 1,902 1.26 24/12/12
+        # 連 2025.10 144.74 43.2 33,609 14,519 7,213 0.82 25/12/11
+        row_pat = re.compile(
+            r"(単|連|U|I)\s+"
+            r"(\d{4}\.\d{2}\*?)\s+"
+            r"([+\-]?\d[\d,]*(?:\.\d+)?|－|-)\s+"   # 1株純資産
+            r"([+\-]?\d[\d,]*(?:\.\d+)?|－|-)\s+"   # 自己資本比率
+            r"([+\-]?\d[\d,]*(?:\.\d+)?|－|-)\s+"   # 総資産
+            r"([+\-]?\d[\d,]*(?:\.\d+)?|－|-)\s+"   # 自己資本
+            r"([+\-]?\d[\d,]*(?:\.\d+)?|－|-)\s+"   # 剰余金
+            r"([+\-]?\d[\d,]*(?:\.\d+)?|－|-)\s+"   # 有利子負債倍率
+            r"(\d{2}/\d{2}/\d{2}|－|-)"             # 発表日
+        )
 
-        i = start_idx + 1
-        while i < len(lines):
-            ln = lines[i]
-
-            if ln.startswith("※単位について") or ln.startswith("・財務") or ln.startswith("◇") or ln.startswith("過去最高") or ln.startswith("ＴＯＰへ"):
-                break
-
-            # 行頭の「単」「連」と決算期は別行になっていることがあるので結合対応
-            if row_pat.match(ln):
-                # 次の行以降に数値列が続くケース
-                row_text = ln
-                j = i + 1
-                while j < len(lines):
-                    nxt = lines[j]
-                    if row_pat.match(nxt) or nxt.startswith("※単位について") or nxt.startswith("・財務") or nxt.startswith("◇") or nxt.startswith("過去最高") or nxt.startswith("ＴＯＰへ"):
-                        break
-                    row_text += " " + nxt
-                    j += 1
-                latest_row = row_text
-                i = j
-                continue
-
-            # 1行にまとまっているケース
-            if re.match(r"^(単|連|U|I)\s+\d{4}\.\d{2}\*?\s+", ln):
-                latest_row = ln
-
-            i += 1
-
-        if not latest_row:
+        rows = list(row_pat.finditer(block))
+        if not rows:
             print(f"[WARN] no finance data row found: {url}", flush=True)
             return ""
 
-        # トークン分解
-        tokens = re.findall(
-            r"(?:単|連|U|I|"
-            r"\d{4}\.\d{2}\*?|"
-            r"[+\-]?\d[\d,]*(?:\.\d+)?|"
-            r"－|-|"
-            r"\d{2}/\d{2}/\d{2})",
-            latest_row
-        )
+        latest = rows[-1]
+        eqr = latest.group(4)  # 自己資本比率
+        if eqr not in ("", "-", "－"):
+            return eqr.replace(",", "")
 
-        # 想定:
-        # 0: 単/連
-        # 1: 決算期
-        # 2: 1株純資産
-        # 3: 自己資本比率
-        # 4: 総資産
-        # 5: 自己資本
-        # 6: 剰余金
-        # 7: 有利子負債倍率
-        # 8: 発表日
-        if len(tokens) >= 4:
-            v = tokens[3]
-            if v not in ("", "-", "－"):
-                return v.replace(",", "")
-
-        print(f"[WARN] latest finance row parsed but equity ratio missing: {latest_row}", flush=True)
+        print(f"[WARN] latest finance row parsed but equity ratio missing: {latest.group(0)}", flush=True)
         return ""
 
     except Exception as e:
