@@ -522,12 +522,14 @@ def jquants_equity_ratio_pct(code):
     return ""
 
 def kabutan_equity_ratio_from_finance_table(code):
+    print(f"[DEBUG-EQR-FUNC] using NEW kabutan_equity_ratio_from_finance_table for {code}", flush=True)
     """
     株探 finance ページ下部の『財務 〖実績〗』表から、
     最新行の自己資本比率を取得する。
 
-    列順:
-      決算期 / １株純資産 / 自己資本比率 / 総資産 / 自己資本 / 剰余金 / 有利子負債倍率 / 発表日
+    例:
+      単 2024.10   93.47 34.2 26,575 9,078 1,902 1.26 24/12/12
+      連 2025.10  144.74 43.2 33,609 14,519 7,213 0.82 25/12/11
     """
     url = KABU_FINANCE.format(code=code)
     try:
@@ -537,12 +539,14 @@ def kabutan_equity_ratio_from_finance_table(code):
             return ""
 
         doc = LH.fromstring(r.text)
+        text = doc.text_content()
+        text = re.sub(r"\r", "\n", text)
 
-        raw_lines = doc.text_content().splitlines()
-        lines = [re.sub(r"\s+", " ", ln).strip() for ln in raw_lines]
+        # 行単位で扱う
+        lines = [re.sub(r"\s+", " ", ln).strip() for ln in text.split("\n")]
         lines = [ln for ln in lines if ln]
 
-        # 「財務 〖実績〗」の開始位置
+        # 「財務 〖実績〗」以降を見る
         start_idx = None
         for i, ln in enumerate(lines):
             if "財務" in ln and "実績" in ln:
@@ -554,36 +558,49 @@ def kabutan_equity_ratio_from_finance_table(code):
             return ""
 
         latest_row = ""
-        # 単 2024.10 / 連 2025.10 / 単 2023.10* のような行を許容
-        row_pat = re.compile(r"^(?:単|連|予|変|旧|新|実|U|I)?\s*(?:\d{4}\.\d{2}\*?|\d{2}\.\d{2}-\d{2})\b")
 
-        for ln in lines[start_idx + 1:]:
-            if (
-                ln.startswith("※単位について")
-                or ln.startswith("・業績推移")
-                or ln.startswith("◇")
-                or ln.startswith("過去最高")
-                or ln.startswith("半期")
-                or ln.startswith("現金収支")
-                or ln.startswith("四半期累計")
-                or ln.startswith("ＴＯＰへ")
-            ):
+        # データ行:
+        # 単 2023.10*
+        # 単 2024.10
+        # 連 2025.10
+        row_pat = re.compile(r"^(単|連|U|I)\s+\d{4}\.\d{2}\*?$")
+
+        i = start_idx + 1
+        while i < len(lines):
+            ln = lines[i]
+
+            if ln.startswith("※単位について") or ln.startswith("・財務") or ln.startswith("◇") or ln.startswith("過去最高") or ln.startswith("ＴＯＰへ"):
                 break
 
-            if row_pat.search(ln):
+            # 行頭の「単」「連」と決算期は別行になっていることがあるので結合対応
+            if row_pat.match(ln):
+                # 次の行以降に数値列が続くケース
+                row_text = ln
+                j = i + 1
+                while j < len(lines):
+                    nxt = lines[j]
+                    if row_pat.match(nxt) or nxt.startswith("※単位について") or nxt.startswith("・財務") or nxt.startswith("◇") or nxt.startswith("過去最高") or nxt.startswith("ＴＯＰへ"):
+                        break
+                    row_text += " " + nxt
+                    j += 1
+                latest_row = row_text
+                i = j
+                continue
+
+            # 1行にまとまっているケース
+            if re.match(r"^(単|連|U|I)\s+\d{4}\.\d{2}\*?\s+", ln):
                 latest_row = ln
+
+            i += 1
 
         if not latest_row:
             print(f"[WARN] no finance data row found: {url}", flush=True)
             return ""
 
-        # 例:
-        # 単 2024.10 93.47 34.2 26,575 9,078 1,902 1.26 24/12/12
-        # 連 2025.10 144.74 43.2 33,609 14,519 7,213 0.82 25/12/11
+        # トークン分解
         tokens = re.findall(
-            r"(?:単|連|予|変|旧|新|実|U|I|"
+            r"(?:単|連|U|I|"
             r"\d{4}\.\d{2}\*?|"
-            r"\d{2}\.\d{2}-\d{2}|"
             r"[+\-]?\d[\d,]*(?:\.\d+)?|"
             r"－|-|"
             r"\d{2}/\d{2}/\d{2})",
