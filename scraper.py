@@ -901,16 +901,54 @@ def kabutan_closes_any(code):
 
     return closes
 
+def kabutan_dev25_from_trend(code):
+    """
+    株探の基本情報ページの『株価トレンド』欄から
+    25日線の乖離率を直接取得する。
+    """
+    url = KABU_OVERVIEW.format(code=code)
+    try:
+        r = requests.get(url, headers=_headers(), timeout=25)
+        if r.status_code != 200 or not r.text:
+            print(f"[WARN] HTML HTTP {r.status_code}: {url}", flush=True)
+            return ""
+
+        doc = LH.fromstring(r.text)
+        text = re.sub(r"\s+", " ", doc.text_content())
+
+        # 株価トレンド欄の 5/25/75/200日線 と 4つの% を拾う
+        m = re.search(
+            r"5日線\s*25日線\s*75日線\s*200日線\s*"
+            r"([+\-]?\d+(?:\.\d+)?)％\s*"
+            r"([+\-]?\d+(?:\.\d+)?)％\s*"
+            r"([+\-]?\d+(?:\.\d+)?)％\s*"
+            r"([+\-]?\d+(?:\.\d+)?)％",
+            text
+        )
+        if m:
+            return m.group(2)  # 2番目が25日線
+
+    except Exception as e:
+        print(f"[ERR] kabutan_dev25_from_trend {url} -> {e}", flush=True)
+
+    return ""
+
 def calc_deviation_25ma(code):
     """
-    25MA乖離率[%] = (直近終値 / 直近25日終値平均 - 1) * 100
-    優先順位:
-      1) J-Quants
-      2) Stooq
-      3) 株探
+    25MA乖離率[%] の優先順位:
+      1) 株探『株価トレンド』欄の25日線乖離率を直接取得
+      2) J-Quants
+      3) Stooq
+      4) 株探の時系列再計算
     """
 
-    # 1) J-Quants
+    # 1) 株探の『株価トレンド』欄を最優先
+    v = kabutan_dev25_from_trend(code)
+    if v != "":
+        print(f"[DEBUG-25MA] {code} source=kabutan_trend dev25={v}", flush=True)
+        return v
+
+    # 2) J-Quants
     closes = jquants_closes_any(code)
     if len(closes) >= 25:
         recent_25 = closes[-25:]
@@ -921,9 +959,8 @@ def calc_deviation_25ma(code):
             dev = (last / ma25 - 1.0) * 100.0
             if -80 <= dev <= 80:
                 return str(round(dev, 4))
-            print(f"[WARN] 25MA deviation looks abnormal for {code} from jquants: {dev}", flush=True)
 
-    # 2) Stooq
+    # 3) Stooq
     closes = stooq_closes_any(code)
     if len(closes) >= 25:
         recent_25 = closes[-25:]
@@ -934,9 +971,8 @@ def calc_deviation_25ma(code):
             dev = (last / ma25 - 1.0) * 100.0
             if -80 <= dev <= 80:
                 return str(round(dev, 4))
-            print(f"[WARN] 25MA deviation looks abnormal for {code} from stooq: {dev}", flush=True)
 
-    # 3) 株探
+    # 4) 株探の時系列再計算
     closes = kabutan_closes_any(code)
     if len(closes) >= 25:
         recent_25 = closes[:25]
@@ -947,7 +983,6 @@ def calc_deviation_25ma(code):
             dev = (last / ma25 - 1.0) * 100.0
             if -80 <= dev <= 80:
                 return str(round(dev, 4))
-            print(f"[WARN] 25MA deviation looks abnormal for {code} from kabutan: {dev}", flush=True)
 
     return ""
 
