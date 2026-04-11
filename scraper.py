@@ -538,12 +538,11 @@ def kabutan_equity_ratio_from_finance_table(code):
 
         doc = LH.fromstring(r.text)
 
-        # 行単位で扱えるようにする
         raw_lines = doc.text_content().splitlines()
         lines = [re.sub(r"\s+", " ", ln).strip() for ln in raw_lines]
         lines = [ln for ln in lines if ln]
 
-        # 「財務 〖実績〗」の開始位置を探す
+        # 「財務 〖実績〗」の開始位置
         start_idx = None
         for i, ln in enumerate(lines):
             if "財務" in ln and "実績" in ln:
@@ -554,13 +553,21 @@ def kabutan_equity_ratio_from_finance_table(code):
             print(f"[WARN] finance section not found: {url}", flush=True)
             return ""
 
-        # そこから先のデータ行だけ拾う
         latest_row = ""
-        row_pat = re.compile(r"^(?:\d{4}\.\d{2}|\d{2}\.\d{2}-\d{2})\b")
+        # 単 2024.10 / 連 2025.10 / 単 2023.10* のような行を許容
+        row_pat = re.compile(r"^(?:単|連|予|変|旧|新|実|U|I)?\s*(?:\d{4}\.\d{2}\*?|\d{2}\.\d{2}-\d{2})\b")
 
         for ln in lines[start_idx + 1:]:
-            # 次の大見出しに行ったら終了
-            if ln.startswith("※単位について") or ln.startswith("過去最高") or ln.startswith("半期") or ln.startswith("現金収支") or ln.startswith("四半期累計") or ln.startswith("ＴＯＰへ"):
+            if (
+                ln.startswith("※単位について")
+                or ln.startswith("・業績推移")
+                or ln.startswith("◇")
+                or ln.startswith("過去最高")
+                or ln.startswith("半期")
+                or ln.startswith("現金収支")
+                or ln.startswith("四半期累計")
+                or ln.startswith("ＴＯＰへ")
+            ):
                 break
 
             if row_pat.search(ln):
@@ -570,22 +577,31 @@ def kabutan_equity_ratio_from_finance_table(code):
             print(f"[WARN] no finance data row found: {url}", flush=True)
             return ""
 
-        # 行のトークンを抜く
         # 例:
-        # 25.04-09 － 77.5 3,636,187 2,817,261 2,832,485 － 25/11/04
-        tokens = re.findall(r"(?:\d{4}\.\d{2}|\d{2}\.\d{2}-\d{2}|[+\-]?\d[\d,]*(?:\.\d+)?|－|-|\d{2}/\d{2}/\d{2})", latest_row)
+        # 単 2024.10 93.47 34.2 26,575 9,078 1,902 1.26 24/12/12
+        # 連 2025.10 144.74 43.2 33,609 14,519 7,213 0.82 25/12/11
+        tokens = re.findall(
+            r"(?:単|連|予|変|旧|新|実|U|I|"
+            r"\d{4}\.\d{2}\*?|"
+            r"\d{2}\.\d{2}-\d{2}|"
+            r"[+\-]?\d[\d,]*(?:\.\d+)?|"
+            r"－|-|"
+            r"\d{2}/\d{2}/\d{2})",
+            latest_row
+        )
 
-        # 期待する並び:
-        # 0: 決算期
-        # 1: 1株純資産
-        # 2: 自己資本比率
-        # 3: 総資産
-        # 4: 自己資本
-        # 5: 剰余金
-        # 6: 有利子負債倍率
-        # 7: 発表日
-        if len(tokens) >= 3:
-            v = tokens[2]
+        # 想定:
+        # 0: 単/連
+        # 1: 決算期
+        # 2: 1株純資産
+        # 3: 自己資本比率
+        # 4: 総資産
+        # 5: 自己資本
+        # 6: 剰余金
+        # 7: 有利子負債倍率
+        # 8: 発表日
+        if len(tokens) >= 4:
+            v = tokens[3]
             if v not in ("", "-", "－"):
                 return v.replace(",", "")
 
