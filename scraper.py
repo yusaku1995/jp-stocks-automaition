@@ -521,13 +521,81 @@ def jquants_equity_ratio_pct(code):
 
     return ""
 
+def kabutan_equity_ratio_from_finance_table(code):
+    """
+    株探の finance ページにある『財務〖実績〗』表から、
+    一番下の最新行の自己資本比率を直接取得する。
+    """
+    url = KABU_FINANCE.format(code=code)
+    try:
+        r = requests.get(url, headers=_headers(), timeout=25)
+        if r.status_code != 200 or not r.text:
+            print(f"[WARN] HTML HTTP {r.status_code}: {url}", flush=True)
+            return ""
+
+        doc = LH.fromstring(r.text)
+        text = re.sub(r"\s+", " ", doc.text_content())
+
+        # 『財務〖実績〗』ブロックをざっくり切り出す
+        m = re.search(
+            r"財務.?実績.?\s*(.*?)\s*(?:※単位について|過去最高|半期|現金収支|四半期累計|ＴＯＰへ)",
+            text
+        )
+        if not m:
+            print(f"[WARN] finance table block not found: {url}", flush=True)
+            return ""
+
+        block = m.group(1)
+
+        # 見出し確認
+        if "自己資本 比率" not in block and "自己資本比率" not in block:
+            print(f"[WARN] equity ratio header not found in finance block: {url}", flush=True)
+            return ""
+
+        # 行を拾う。例:
+        # 2023.03 1946.55 79.4 ...
+        # 25.04-09 － 77.5 ...
+        rows = re.findall(
+            r"((?:\d{4}\.\d{2}|\d{2}\.\d{2}-\d{2})\s+.*?)(?=(?:\d{4}\.\d{2}|\d{2}\.\d{2}-\d{2})\s+|$)",
+            block
+        )
+        if not rows:
+            print(f"[WARN] no finance rows parsed: {url}", flush=True)
+            return ""
+
+        latest = rows[-1]
+
+        # 行頭の決算期を除いて数値トークンを抜く
+        # 財務表はおおむね:
+        # 決算期 / 1株純資産 / 自己資本比率 / 総資産 / 自己資本 / 剰余金 / 有利子負債倍率 / 発表日
+        tail = re.sub(r"^(?:\d{4}\.\d{2}|\d{2}\.\d{2}-\d{2})\s+", "", latest)
+        vals = re.findall(r"[+\-]?\d+(?:\.\d+)?|－|-", tail)
+
+        # 2番目が自己資本比率
+        if len(vals) >= 2:
+            v = vals[1]
+            if v not in ("", "-", "－"):
+                return v
+
+        print(f"[WARN] latest finance row parsed but equity ratio missing: {latest}", flush=True)
+        return ""
+
+    except Exception as e:
+        print(f"[ERR] kabutan_equity_ratio_from_finance_table {url} -> {e}", flush=True)
+        return ""
+
 def kabu_equity_ratio_pct(code):
+    # 1) 株探 finance ページの『財務〖実績〗』表から直接取得
+    v = kabutan_equity_ratio_from_finance_table(code)
+    if v != "":
+        return v
+
     def _try_xpaths(url, xps):
         for xp in xps:
             t = _get_first_text_by_xpath(url, xp)
-            v = _num_pct_sane(t)
-            if v != "":
-                return v
+            vv = _num_pct_sane(t)
+            if vv != "":
+                return vv
         return ""
 
     def _try_regex(url):
@@ -541,6 +609,7 @@ def kabu_equity_ratio_pct(code):
             pass
         return ""
 
+    # 2) 既存の直接取得フォールバック
     url_f = KABU_FINANCE.format(code=code)
     xps_f = [
         "//th[contains(.,'自己資本比率')]/following-sibling::td[1]",
@@ -564,32 +633,6 @@ def kabu_equity_ratio_pct(code):
     if v != "":
         return v
     v = _try_regex(url_o)
-    if v != "":
-        return v
-
-    # 計算フォールバック
-    equity = _kabu_pick_latest_number(url_f, ["自己資本", "株主資本"])
-    assets = _kabu_pick_latest_number(url_f, ["総資産", "資産合計", "資産総額"])
-    if equity != "" and assets != "":
-        try:
-            equity = float(equity)
-            assets = float(assets)
-            if assets > 0:
-                ratio = equity / assets * 100.0
-                if 0 <= ratio <= 100:
-                    return str(round(ratio, 2))
-        except Exception:
-            pass
-
-    url_ir = IR_HTML.format(code=code)
-    xps_ir = [
-        "(//*[contains(text(),'自己資本比率')])[1]/following::text()[1]",
-    ]
-    v = _try_xpaths(url_ir, xps_ir)
-    if v != "":
-        return v
-
-    v = _try_regex(url_ir)
     if v != "":
         return v
 
