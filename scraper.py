@@ -658,20 +658,40 @@ def kabutan_closes_any(code):
                 doc = LH.fromstring(r.text)
                 tables = doc.xpath("//table[contains(@class,'stock_kabuka') or contains(@class,'kabuka')]")
                 found = False
+
                 for tb in tables:
-                    rows = tb.xpath(".//tr[td]")
-                    for tr in rows:
+                    rows = tb.xpath(".//tr")
+                    if not rows:
+                        continue
+
+                    # 1行目をヘッダーとして見て、終値列の位置を特定
+                    header_cells = rows[0].xpath("./th|./td")
+                    headers = [re.sub(r"\s+", " ", c.text_content().strip()) for c in header_cells]
+
+                    close_idx = None
+                    for idx, h in enumerate(headers):
+                        if h in ("終値", "終値(円)", "終値（円）") or "終値" in h:
+                            close_idx = idx
+                            break
+
+                    if close_idx is None:
+                        print(f"[WARN] Kabutan closes: close column not found on page {page} for {code} headers={headers}", flush=True)
+                        continue
+
+                    for tr in rows[1:]:
                         tds = [re.sub(r"\s+", " ", td.text_content().strip()) for td in tr.xpath("./td")]
-                        # 想定: 日付/始値/高値/安値/終値/出来高 などで6列以上
-                        if len(tds) >= 5:
-                            ctxt = tds[-2]  # 終値は後ろから2番目が多い
-                            cnum = re.sub(r"[^\d.\-]", "", ctxt)
-                            if cnum not in ("", "-", "."):
-                                try:
-                                    closes.append(float(cnum))
-                                    found = True
-                                except:
-                                    pass
+                        if len(tds) <= close_idx:
+                            continue
+
+                        ctxt = tds[close_idx]
+                        cnum = re.sub(r"[^\d.\-]", "", ctxt)
+                        if cnum not in ("", "-", ".", "-."):
+                            try:
+                                closes.append(float(cnum))
+                                found = True
+                            except:
+                                pass
+
                 if not found:
                     print(f"[WARN] Kabutan closes: table not parsed on page {page} for {code}", flush=True)
             else:
@@ -680,9 +700,9 @@ def kabutan_closes_any(code):
             print(f"[ERR] Kabutan closes fetch {url} -> {e}", flush=True)
         page += 1
         polite_sleep(1.0)
-    # 株探は最新が先頭に来ることが多いので、このままの並びでOK（最新が index 0）
-    # Stooqの closes は末尾が最新なので、後で整合取る
-    return closes  # 先頭が最新の想定
+
+    # 株探は最新が先頭に来る想定
+    return closes
 
 def calc_deviation_25ma(code):
     """
@@ -691,19 +711,23 @@ def calc_deviation_25ma(code):
     """
     closes = stooq_closes_any(code)
     if len(closes) >= 25:
-        last = closes[-1]               # Stooqは末尾が最新
-        ma25 = sum(closes[-25:]) / 25.0
+        recent_25 = closes[-25:]   # Stooqは末尾が最新
+        last = recent_25[-1]
+        ma25 = sum(recent_25) / 25.0
         if ma25 > 0:
             return str(round((last / ma25 - 1.0) * 100.0, 4))
         return ""
-    # フォールバック：株探（先頭が最新の想定）
+
     closes = kabutan_closes_any(code)
     if len(closes) >= 25:
-        last = closes[0]                # 株探は先頭が最新の想定
-        ma25 = sum(closes[:25]) / 25.0
+        recent_25 = closes[:25]    # 株探は先頭が最新
+        last = recent_25[0]
+        ma25 = sum(recent_25) / 25.0
+        print(f"[DEBUG-25MA] {code} source=stooq last={last} ma25={ma25} closes={recent_25}", flush=True)
         if ma25 > 0:
             return str(round((last / ma25 - 1.0) * 100.0, 4))
         return ""
+
     return ""
 
 # ====== Main ======
