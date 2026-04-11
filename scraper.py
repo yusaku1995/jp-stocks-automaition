@@ -523,8 +523,8 @@ def jquants_equity_ratio_pct(code):
 
 def kabutan_equity_ratio_from_finance_table(code):
     """
-    株探の finance ページにある『財務〖実績〗』表から、
-    一番下の最新行の自己資本比率を直接取得する。
+    株探 finance ページ下部の『財務 〖実績〗』表から、
+    『自己資本比率』列の最新行の値を取得する。
     """
     url = KABU_FINANCE.format(code=code)
     try:
@@ -536,32 +536,64 @@ def kabutan_equity_ratio_from_finance_table(code):
         doc = LH.fromstring(r.text)
         text = re.sub(r"\s+", " ", doc.text_content())
 
-        # 『財務〖実績〗』ブロックをざっくり切り出す
+        # 「財務 〖実績〗」ブロックだけを切り出す
         m = re.search(
             r"財務.?実績.?\s*(.*?)\s*(?:※単位について|過去最高|半期|現金収支|四半期累計|ＴＯＰへ)",
             text
         )
         if not m:
-            print(f"[WARN] finance table block not found: {url}", flush=True)
+            print(f"[WARN] finance block not found: {url}", flush=True)
             return ""
 
         block = m.group(1)
 
-        # 見出し確認
-        if "自己資本 比率" not in block and "自己資本比率" not in block:
-            print(f"[WARN] equity ratio header not found in finance block: {url}", flush=True)
+        # 見出し行を確認
+        # 決算期 １株純資産 自己資本比率 総資産 自己資本 剰余金 有利子負債倍率 発表日
+        header_match = re.search(
+            r"決算期\s+１株純資産\s+自己資本比率\s+総資産\s+自己資本\s+剰余金\s+有利子負債倍率\s+発表日",
+            block
+        )
+        if not header_match:
+            print(f"[WARN] finance header not found: {url}", flush=True)
             return ""
 
-        # 行を拾う。例:
-        # 2023.03 1946.55 79.4 ...
-        # 25.04-09 － 77.5 ...
+        # データ行を抜く
+        # 例:
+        # 2023.03 1946.55 79.4 2854284 2266234 2392704 - 23/05/09
+        # 25.04-09 - 77.5 3636187 2817261 2832485 - 25/11/04
         rows = re.findall(
-            r"((?:\d{4}\.\d{2}|\d{2}\.\d{2}-\d{2})\s+.*?)(?=(?:\d{4}\.\d{2}|\d{2}\.\d{2}-\d{2})\s+|$)",
+            r"((?:\d{4}\.\d{2}|\d{2}\.\d{2}-\d{2})\s+.*?\s+\d{2}/\d{2}/\d{2})",
             block
         )
         if not rows:
             print(f"[WARN] no finance rows parsed: {url}", flush=True)
             return ""
+
+        latest = rows[-1]
+
+        # 各列をトークン化
+        vals = re.findall(r"(?:\d{4}\.\d{2}|\d{2}\.\d{2}-\d{2}|[+\-]?\d+(?:\.\d+)?|－|-|\d{2}/\d{2}/\d{2})", latest)
+
+        # 列順:
+        # 0: 決算期
+        # 1: １株純資産
+        # 2: 自己資本比率
+        # 3: 総資産
+        # 4: 自己資本
+        # 5: 剰余金
+        # 6: 有利子負債倍率
+        # 7: 発表日
+        if len(vals) >= 3:
+            v = vals[2]
+            if v not in ("", "-", "－"):
+                return v
+
+        print(f"[WARN] parsed latest row but equity ratio missing: {latest}", flush=True)
+        return ""
+
+    except Exception as e:
+        print(f"[ERR] kabutan_equity_ratio_from_finance_table {url} -> {e}", flush=True)
+        return ""
 
         latest = rows[-1]
 
