@@ -3,6 +3,7 @@
 
 import os, io, csv, re, time, random, requests
 from lxml import html as LH
+from datetime import date, timedelta
 
 # ====== Base headers / helpers ======
 UA_POOL = [
@@ -27,6 +28,8 @@ STOOQ   = "https://stooq.com/q/d/l/?s={code}.jp&i=d"
 KABU_OVERVIEW = "https://kabutan.jp/stock/?code={code}"
 KABU_FINANCE  = "https://kabutan.jp/stock/finance?code={code}"
 KABU_KABUKA   = "https://kabutan.jp/stock/kabuka?code={code}&ashi=day&page={page}"
+JQ_DAILY_QUOTES   = "https://api.jquants.com/v1/prices/daily_quotes"
+JQ_FINS_STATEMENTS = "https://api.jquants.com/v1/fins/statements"
 
 CSV_PL="fy-profit-and-loss.csv"
 CSV_BS="fy-balance-sheet.csv"
@@ -336,6 +339,35 @@ def _num_pct_sane(s):
         return str(f)
     except:
         return ""
+def _jquants_headers():
+    token = os.getenv("JQUANTS_ID_TOKEN", "").strip()
+    if not token:
+        return None
+    return {"Authorization": f"Bearer {token}"}
+
+def _jquants_get(url, params):
+    headers = _jquants_headers()
+    if not headers:
+        return None
+    try:
+        r = requests.get(url, headers=headers, params=params, timeout=25)
+        if r.status_code == 200:
+            return r.json()
+        print(f"[WARN] J-Quants {url} -> HTTP {r.status_code}", flush=True)
+    except Exception as e:
+        print(f"[ERR] J-Quants {url} -> {e}", flush=True)
+    return None
+
+def _to_float_or_blank(x):
+    if x is None:
+        return ""
+    s = str(x).replace(",", "").strip()
+    if s in ("", "-", "None", "null"):
+        return ""
+    try:
+        return float(s)
+    except Exception:
+        return ""
 
 # ====== Kabutan overview/finance quick getters ======
 def kabu_per(code):
@@ -440,6 +472,53 @@ def _kabu_pick_latest_number(url, label_keywords):
         return ""
 
 # --- 置換版: 自己資本比率（%） 多段フォールバック + 計算 ---
+
+def jquants_equity_ratio_pct(code):
+    """
+    J-Quants の財務情報から自己資本比率を取得。
+    まず EquityToAssetRatio を直接使い、
+    無ければ Equity / TotalAssets * 100 を計算する。
+    """
+    data = _jquants_get(JQ_FINS_STATEMENTS, {"code": code})
+    if not data:
+        return ""
+
+    rows = data.get("statements", [])
+    if not rows:
+        return ""
+
+    def _sort_key(r):
+        return (
+            r.get("CurrentFiscalYearEndDate", ""),
+            r.get("DisclosedDate", ""),
+            r.get("DisclosedTime", ""),
+        )
+
+    fy_rows = [r for r in rows if str(r.get("TypeOfCurrentPeriod", "")).upper() == "FY"]
+    target_rows = sorted(fy_rows or rows, key=_sort_key, reverse=True)
+
+    for row in target_rows:
+        for k in ("EquityToAssetRatio", "NonConsolidatedEquityToAssetRatio"):
+            v = _num_pct_sane(row.get(k, ""))
+            if v != "":
+                return v
+
+        eq = _to_float_or_blank(row.get("Equity"))
+        ta = _to_float_or_blank(row.get("TotalAssets"))
+        if eq == "" or ta == "":
+            eq = _to_float_or_blank(row.get("NonConsolidatedEquity"))
+            ta = _to_float_or_blank(row.get("NonConsolidatedTotalAssets"))
+
+        if eq != "" and ta not in ("", 0):
+            try:
+                ratio = float(eq) / float(ta) * 100.0
+                if 0 <= ratio <= 100:
+                    return str(round(ratio, 2))
+            except Exception:
+                pass
+
+    return ""
+
 def kabu_equity_ratio_pct(code):
     def _try_xpaths(url, xps):
         for xp in xps:
@@ -684,6 +763,38 @@ def get_vols(code):
         v5, v25, vr = kabutan_vols_any(code)
     return v5, v25, vr
 
+def jquants_closes_any(code):
+    """
+    J-Quants の日次株価から調整済み終値を取得。
+    返り値は古い→新しい順。
+    """
+    date_from = (date.today() - timedelta(days=120)).isoformat()
+
+    data = _jquants_get(JQ_DAILY_QUOTES, {
+        "code": code,
+        "from": date_from,
+    })
+    if not data:
+        return []
+
+    rows = data.get("daily_quotes", [])
+    if not rows:
+        return []
+
+    rows = sorted(rows, key=lambda x: x.get("Date", ""))
+
+    closes = []
+    for row in rows:
+        v = _to_float_or_blank(row.get("AdjustmentClose"))
+        if v == "":
+            v = _to_float_or_blank(row.get("Close"))
+        if v != "" and v > 0:
+            closes.append(v)
+
+    if len(closes) >= 25:
+        return closes
+    return []
+
 # ====== 25MA 乖離率（Stooq優先 → 株探フォールバック） ======
 def stooq_closes_any(code):
     """StooqのCSVから終値列を取得。怪しい系列は捨てる。"""
@@ -791,30 +902,45 @@ def kabutan_closes_any(code):
 def calc_deviation_25ma(code):
     """
     25MA乖離率[%] = (直近終値 / 直近25日終値平均 - 1) * 100
-    Stooqが怪しければ株探へフォールバック。
+    優先順位:
+      1) J-Quants
+      2) Stooq
+      3) 株探
     """
+
+    # 1) J-Quants
+    closes = jquants_closes_any(code)
+    if len(closes) >= 25:
+        recent_25 = closes[-25:]
+        last = recent_25[-1]
+        ma25 = sum(recent_25) / 25.0
+        print(f"[DEBUG-25MA] {code} source=jquants last={last} ma25={ma25} closes={recent_25}", flush=True)
+        if ma25 > 0:
+            dev = (last / ma25 - 1.0) * 100.0
+            if -80 <= dev <= 80:
+                return str(round(dev, 4))
+            print(f"[WARN] 25MA deviation looks abnormal for {code} from jquants: {dev}", flush=True)
+
+    # 2) Stooq
     closes = stooq_closes_any(code)
     if len(closes) >= 25:
         recent_25 = closes[-25:]
         last = recent_25[-1]
         ma25 = sum(recent_25) / 25.0
-
         print(f"[DEBUG-25MA] {code} source=stooq last={last} ma25={ma25} closes={recent_25}", flush=True)
-
         if ma25 > 0:
             dev = (last / ma25 - 1.0) * 100.0
             if -80 <= dev <= 80:
                 return str(round(dev, 4))
             print(f"[WARN] 25MA deviation looks abnormal for {code} from stooq: {dev}", flush=True)
 
+    # 3) 株探
     closes = kabutan_closes_any(code)
     if len(closes) >= 25:
         recent_25 = closes[:25]
         last = recent_25[0]
         ma25 = sum(recent_25) / 25.0
-
         print(f"[DEBUG-25MA] {code} source=kabutan last={last} ma25={ma25} closes={recent_25}", flush=True)
-
         if ma25 > 0:
             dev = (last / ma25 - 1.0) * 100.0
             if -80 <= dev <= 80:
@@ -860,7 +986,7 @@ def main():
         per      = kabu_per(code) or ""
         pbr      = kabu_pbr(code) or ir_pbr(code) or ""
         roe_pct  = kabu_roe_pct(code) or (str(roe_pct_calc) if roe_pct_calc != "" else "")
-        eqr_pct  = kabu_equity_ratio_pct(code) or (str(eqr_pct_calc) if eqr_pct_calc != "" else "")
+        eqr_pct  = jquants_equity_ratio_pct(code) or kabu_equity_ratio_pct(code) or (str(eqr_pct_calc) if eqr_pct_calc != "" else "")
         print(f"[DEBUG-EQR] {code} eqr%={eqr_pct} eq={eq} assets={assets} eqr_pct_calc={eqr_pct_calc}", flush=True)
         divy_pct = kabu_divy_pct(code)
         credit   = kabu_credit(code) or ir_credit(code) or ""
