@@ -529,15 +529,15 @@ def kabu_equity_ratio_pct(code):
     equity = _kabu_pick_latest_number(url_f, ["自己資本", "純資産", "株主資本"])
     assets = _kabu_pick_latest_number(url_f, ["総資産", "資産合計", "資産総額"])
     if equity != "" and assets != "":
-    try:
-        equity = float(equity)
-        assets = float(assets)
-        if assets > 0:
-            ratio = equity / assets * 100.0
-            if 0 <= ratio <= 100:
-                return str(round(ratio, 2))
-    except:
-        pass
+        try:
+            equity = float(equity)
+            assets = float(assets)
+            if assets > 0:
+                ratio = equity / assets * 100.0
+                if 0 <= ratio <= 100:
+                    return str(round(ratio, 2))
+       except Exception:
+           pass
 
     # 5) IRBANK HTML でも一応トライ（軽め）
     url_ir = IR_HTML.format(code=code)
