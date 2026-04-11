@@ -348,9 +348,11 @@ def _jquants_headers():
 def _jquants_get(url, params):
     headers = _jquants_headers()
     if not headers:
+        print(f"[DEBUG-JQ] no token for {url}", flush=True)
         return None
     try:
         r = requests.get(url, headers=headers, params=params, timeout=25)
+        print(f"[DEBUG-JQ] {url} status={r.status_code} params={params}", flush=True)
         if r.status_code == 200:
             return r.json()
         print(f"[WARN] J-Quants {url} -> HTTP {r.status_code}", flush=True)
@@ -963,6 +965,7 @@ def main():
         codes = codes[offset:offset+limit]
 
     print(f"Total tickers to process in this shard: {len(codes)}", flush=True)
+    print(f"[DEBUG-JQ] token_exists={bool(os.getenv('JQUANTS_ID_TOKEN', '').strip())}", flush=True)
 
     out = []
     for i, code in enumerate(codes, 1):
