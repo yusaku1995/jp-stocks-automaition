@@ -463,7 +463,7 @@ def kabu_equity_ratio_pct(code):
     url_o = KABU_OVERVIEW.format(code=code)
     xps_o = [
         "//*[contains(text(),'自己資本比率')][1]/following::text()[1]",
-        "//*[contains(text(),'自己資本比率')]/ancestor::*[self::tr or self::li][1]/*[self::td or self::dd][1]"
+        "//*[contains(text(),'自己資本比率')]/ancestor::*[self::tr or self::li][1]/*[self::td or self::dd][1]",
     ]
     v = _try_xpaths(url_o, xps_o)
     if v != "":
@@ -477,7 +477,7 @@ def kabu_equity_ratio_pct(code):
     if v != "":
         return v
 
-    # 4) “計算”フォールバック：株探 財務ページから 自己資本/総資産 を拾って比率化
+    # 4) 計算フォールバック
     equity = _kabu_pick_latest_number(url_f, ["自己資本", "純資産", "株主資本"])
     assets = _kabu_pick_latest_number(url_f, ["総資産", "資産合計", "資産総額"])
     if equity != "" and assets != "":
@@ -495,7 +495,7 @@ def kabu_equity_ratio_pct(code):
     url_ir = IR_HTML.format(code=code)
     xps_ir = [
         "(//*[contains(text(),'自己資本比率')])[1]/following::text()[1]",
-        "//*[contains(text(),'自己資本比率')]/ancestor::*[self::tr or self::li or self::dl or self::div][1]/*[self::td or self::dd][1]"
+        "//*[contains(text(),'自己資本比率')]/ancestor::*[self::tr or self::li or self::dl or self::div][1]/*[self::td or self::dd][1]",
     ]
     v = _try_xpaths(url_ir, xps_ir)
     if v != "":
@@ -536,8 +536,8 @@ def kabu_equity_ratio_pct(code):
                 ratio = equity / assets * 100.0
                 if 0 <= ratio <= 100:
                     return str(round(ratio, 2))
-       except Exception:
-           pass
+        except Exception:
+            pass
 
     # 5) IRBANK HTML でも一応トライ（軽め）
     url_ir = IR_HTML.format(code=code)
