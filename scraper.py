@@ -524,7 +524,10 @@ def jquants_equity_ratio_pct(code):
 def kabutan_equity_ratio_from_finance_table(code):
     """
     株探 finance ページ下部の『財務 〖実績〗』表から、
-    『自己資本比率』列の最新行の値を取得する。
+    最新行の自己資本比率を取得する。
+
+    列順:
+      決算期 / １株純資産 / 自己資本比率 / 総資産 / 自己資本 / 剰余金 / 有利子負債倍率 / 発表日
     """
     url = KABU_FINANCE.format(code=code)
     try:
@@ -534,82 +537,59 @@ def kabutan_equity_ratio_from_finance_table(code):
             return ""
 
         doc = LH.fromstring(r.text)
-        text = re.sub(r"\s+", " ", doc.text_content())
 
-        # 「財務 〖実績〗」ブロックだけを切り出す
-        m = re.search(
-            r"財務.?実績.?\s*(.*?)\s*(?:※単位について|過去最高|半期|現金収支|四半期累計|ＴＯＰへ)",
-            text
-        )
-        if not m:
-            print(f"[WARN] finance block not found: {url}", flush=True)
+        # 行単位で扱えるようにする
+        raw_lines = doc.text_content().splitlines()
+        lines = [re.sub(r"\s+", " ", ln).strip() for ln in raw_lines]
+        lines = [ln for ln in lines if ln]
+
+        # 「財務 〖実績〗」の開始位置を探す
+        start_idx = None
+        for i, ln in enumerate(lines):
+            if "財務" in ln and "実績" in ln:
+                start_idx = i
+                break
+
+        if start_idx is None:
+            print(f"[WARN] finance section not found: {url}", flush=True)
             return ""
 
-        block = m.group(1)
+        # そこから先のデータ行だけ拾う
+        latest_row = ""
+        row_pat = re.compile(r"^(?:\d{4}\.\d{2}|\d{2}\.\d{2}-\d{2})\b")
 
-        # 見出し行を確認
-        # 決算期 １株純資産 自己資本比率 総資産 自己資本 剰余金 有利子負債倍率 発表日
-        header_match = re.search(
-            r"決算期\s+１株純資産\s+自己資本比率\s+総資産\s+自己資本\s+剰余金\s+有利子負債倍率\s+発表日",
-            block
-        )
-        if not header_match:
-            print(f"[WARN] finance header not found: {url}", flush=True)
+        for ln in lines[start_idx + 1:]:
+            # 次の大見出しに行ったら終了
+            if ln.startswith("※単位について") or ln.startswith("過去最高") or ln.startswith("半期") or ln.startswith("現金収支") or ln.startswith("四半期累計") or ln.startswith("ＴＯＰへ"):
+                break
+
+            if row_pat.search(ln):
+                latest_row = ln
+
+        if not latest_row:
+            print(f"[WARN] no finance data row found: {url}", flush=True)
             return ""
 
-        # データ行を抜く
+        # 行のトークンを抜く
         # 例:
-        # 2023.03 1946.55 79.4 2854284 2266234 2392704 - 23/05/09
-        # 25.04-09 - 77.5 3636187 2817261 2832485 - 25/11/04
-        rows = re.findall(
-            r"((?:\d{4}\.\d{2}|\d{2}\.\d{2}-\d{2})\s+.*?\s+\d{2}/\d{2}/\d{2})",
-            block
-        )
-        if not rows:
-            print(f"[WARN] no finance rows parsed: {url}", flush=True)
-            return ""
+        # 25.04-09 － 77.5 3,636,187 2,817,261 2,832,485 － 25/11/04
+        tokens = re.findall(r"(?:\d{4}\.\d{2}|\d{2}\.\d{2}-\d{2}|[+\-]?\d[\d,]*(?:\.\d+)?|－|-|\d{2}/\d{2}/\d{2})", latest_row)
 
-        latest = rows[-1]
-
-        # 各列をトークン化
-        vals = re.findall(r"(?:\d{4}\.\d{2}|\d{2}\.\d{2}-\d{2}|[+\-]?\d+(?:\.\d+)?|－|-|\d{2}/\d{2}/\d{2})", latest)
-
-        # 列順:
+        # 期待する並び:
         # 0: 決算期
-        # 1: １株純資産
+        # 1: 1株純資産
         # 2: 自己資本比率
         # 3: 総資産
         # 4: 自己資本
         # 5: 剰余金
         # 6: 有利子負債倍率
         # 7: 発表日
-        if len(vals) >= 3:
-            v = vals[2]
+        if len(tokens) >= 3:
+            v = tokens[2]
             if v not in ("", "-", "－"):
-                return v
+                return v.replace(",", "")
 
-        print(f"[WARN] parsed latest row but equity ratio missing: {latest}", flush=True)
-        return ""
-
-    except Exception as e:
-        print(f"[ERR] kabutan_equity_ratio_from_finance_table {url} -> {e}", flush=True)
-        return ""
-
-        latest = rows[-1]
-
-        # 行頭の決算期を除いて数値トークンを抜く
-        # 財務表はおおむね:
-        # 決算期 / 1株純資産 / 自己資本比率 / 総資産 / 自己資本 / 剰余金 / 有利子負債倍率 / 発表日
-        tail = re.sub(r"^(?:\d{4}\.\d{2}|\d{2}\.\d{2}-\d{2})\s+", "", latest)
-        vals = re.findall(r"[+\-]?\d+(?:\.\d+)?|－|-", tail)
-
-        # 2番目が自己資本比率
-        if len(vals) >= 2:
-            v = vals[1]
-            if v not in ("", "-", "－"):
-                return v
-
-        print(f"[WARN] latest finance row parsed but equity ratio missing: {latest}", flush=True)
+        print(f"[WARN] latest finance row parsed but equity ratio missing: {latest_row}", flush=True)
         return ""
 
     except Exception as e:
