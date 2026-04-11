@@ -114,16 +114,25 @@ def get_csv(code, path):
     if not is_numeric4(code):
         print(f"[SKIP] IRBANK CSV likely missing for non-4digit: {code}", flush=True)
         return None
+
     url = IR_CSV.format(code=code, path=path)
     for i in range(RETRIES):
         try:
             r = requests.get(url, headers=_headers(), timeout=20)
-            ctype = r.headers.get("Content-Type","")
+            ctype = r.headers.get("Content-Type", "")
+
+            # 404 は「そのCSVが存在しない」可能性が高いので即終了
+            if r.status_code == 404:
+                print(f"[MISS] {url} -> HTTP 404", flush=True)
+                return None
+
             if not r.ok:
                 print(f"[WARN] {url} -> HTTP {r.status_code}", flush=True)
+
             elif "text/csv" not in ctype and "application/octet-stream" not in ctype:
-                head=(r.text or "")[:200].replace("\n"," ")
+                head = (r.text or "")[:200].replace("\n", " ")
                 print(f"[WARN] {url} -> non-CSV ({ctype}). head='{head}'", flush=True)
+
             else:
                 rows = list(csv.reader(io.StringIO(r.text)))
                 if len(rows) >= 2:
@@ -132,9 +141,12 @@ def get_csv(code, path):
                     return rows
                 else:
                     print(f"[WARN] {url} CSV too short", flush=True)
+
         except Exception as e:
             print(f"[ERR] {url} -> {e}", flush=True)
+
         polite_sleep(2 + 2*i)
+
     print(f"[FAIL] {url} retried {RETRIES}x", flush=True)
     return None
 
