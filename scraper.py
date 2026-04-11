@@ -450,14 +450,62 @@ def kabu_equity_ratio_pct(code):
     # 1) 株探 財務ページ: 直接%を拾う
     url_f = KABU_FINANCE.format(code=code)
     xps_f = [
-    "//th[contains(.,'自己資本比率')]/following-sibling::td[1]",
-    "//tr[.//*[contains(normalize-space(.),'自己資本比率')]]/*[self::td][1]",
-    "//*[contains(text(),'自己資本比率')]/following::td[1]",
-    "//*[contains(text(),'自己資本比率')]/ancestor::*[self::tr or self::li or self::dl or self::div][1]/*[self::td or self::dd][1]",
+        "//th[contains(.,'自己資本比率')]/following-sibling::td[1]",
+        "//tr[.//*[contains(normalize-space(.),'自己資本比率')]]/*[self::td][1]",
+        "//*[contains(text(),'自己資本比率')]/following::td[1]",
+        "//*[contains(text(),'自己資本比率')]/ancestor::*[self::tr or self::li or self::dl or self::div][1]/*[self::td or self::dd][1]",
     ]
     v = _try_xpaths(url_f, xps_f)
     if v != "":
         return v
+
+    # 2) 株探 概要ページ
+    url_o = KABU_OVERVIEW.format(code=code)
+    xps_o = [
+        "//*[contains(text(),'自己資本比率')][1]/following::text()[1]",
+        "//*[contains(text(),'自己資本比率')]/ancestor::*[self::tr or self::li][1]/*[self::td or self::dd][1]"
+    ]
+    v = _try_xpaths(url_o, xps_o)
+    if v != "":
+        return v
+
+    # 3) 正規表現（財務→概要）
+    v = _try_regex(url_f)
+    if v != "":
+        return v
+    v = _try_regex(url_o)
+    if v != "":
+        return v
+
+    # 4) “計算”フォールバック：株探 財務ページから 自己資本/総資産 を拾って比率化
+    equity = _kabu_pick_latest_number(url_f, ["自己資本", "純資産", "株主資本"])
+    assets = _kabu_pick_latest_number(url_f, ["総資産", "資産合計", "資産総額"])
+    if equity != "" and assets != "":
+        try:
+            equity = float(equity)
+            assets = float(assets)
+            if assets > 0:
+                ratio = equity / assets * 100.0
+                if 0 <= ratio <= 100:
+                    return str(round(ratio, 2))
+        except Exception:
+            pass
+
+    # 5) IRBANK HTML でも一応トライ
+    url_ir = IR_HTML.format(code=code)
+    xps_ir = [
+        "(//*[contains(text(),'自己資本比率')])[1]/following::text()[1]",
+        "//*[contains(text(),'自己資本比率')]/ancestor::*[self::tr or self::li or self::dl or self::div][1]/*[self::td or self::dd][1]"
+    ]
+    v = _try_xpaths(url_ir, xps_ir)
+    if v != "":
+        return v
+
+    v = _try_regex(url_ir)
+    if v != "":
+        return v
+
+    return ""
 
     # 2) 株探 概要ページ
     url_o = KABU_OVERVIEW.format(code=code)
