@@ -522,9 +522,11 @@ def jquants_equity_ratio_pct(code):
     return ""
 
 def kabutan_equity_ratio_from_finance_table(code):
+    print(f"[DEBUG-EQR-FUNC] ACTIVE kabutan_equity_ratio_from_finance_table {code}", flush=True)
     """
     株探 finance ページ下部の『財務 〖実績〗』表から、
     最新行の自己資本比率を取得する。
+    215A なら最新行は『連 2025.10 ... 43.2 ...』なので 43.2 を返したい。
     """
     url = KABU_FINANCE.format(code=code)
     try:
@@ -537,25 +539,7 @@ def kabutan_equity_ratio_from_finance_table(code):
         text = doc.text_content()
         text = re.sub(r"\s+", " ", text)
 
-        # 「財務 〖実績〗」ブロックを切り出す
-        m = re.search(
-            r"### 財務 .*? 実績.*?"
-            r"決算期 .*? 発表日 "
-            r"(.*?) "
-            r"※単位について",
-            text
-        )
-        if not m:
-            print(f"[WARN] finance block not found: {url}", flush=True)
-            return ""
-
-        block = m.group(1)
-
-        # データ行を全部拾う
-        # 例:
-        # 単 2023.10* -15,600.00 34.7 17,800 6,182 -894 1.32 -
-        # 単 2024.10 93.47 34.2 26,575 9,078 1,902 1.26 24/12/12
-        # 連 2025.10 144.74 43.2 33,609 14,519 7,213 0.82 25/12/11
+        # 財務【実績】のヘッダ以降から実績行だけ拾う
         row_pat = re.compile(
             r"(単|連|U|I)\s+"
             r"(\d{4}\.\d{2}\*?)\s+"
@@ -568,17 +552,20 @@ def kabutan_equity_ratio_from_finance_table(code):
             r"(\d{2}/\d{2}/\d{2}|－|-)"             # 発表日
         )
 
-        rows = list(row_pat.finditer(block))
+        rows = list(row_pat.finditer(text))
         if not rows:
             print(f"[WARN] no finance data row found: {url}", flush=True)
             return ""
 
         latest = rows[-1]
-        eqr = latest.group(4)  # 自己資本比率
+        eqr = latest.group(4)
+
+        print(f"[DEBUG-EQR-ROW] latest_row={latest.group(0)}", flush=True)
+        print(f"[DEBUG-EQR-VAL] eqr={eqr}", flush=True)
+
         if eqr not in ("", "-", "－"):
             return eqr.replace(",", "")
 
-        print(f"[WARN] latest finance row parsed but equity ratio missing: {latest.group(0)}", flush=True)
         return ""
 
     except Exception as e:
