@@ -401,9 +401,7 @@ def kabu_credit(code):
 # === 追加: 株探の財務表から行マッチ → 最新数値を取る ===
 def _kabu_pick_latest_number(url, label_keywords):
     """
-    株探/財務ページの表(<tr>)を走査し、
-    見出しに label_keywords のいずれかを含む行から
-    項目名セルを除いた数値セルのうち、左端の値を返す。
+    株探/財務ページの表から、対象行のデータセルだけを見て左端の数値を返す。
     """
     try:
         r = requests.get(url, headers=_headers(), timeout=25)
@@ -416,19 +414,21 @@ def _kabu_pick_latest_number(url, label_keywords):
         for tr in doc.xpath("//tr[td or th]"):
             cells = tr.xpath("./th|./td")
             texts = [re.sub(r"\s+", " ", c.text_content().strip()) for c in cells]
-            txt_all = " ".join(texts)
-
-            if not any(k in txt_all for k in label_keywords):
+            if not texts:
                 continue
 
-            # 先頭セルは項目名のことが多いので除外
-            data_cells = cells[1:] if len(cells) >= 2 else cells
+            row_label = texts[0]
+            if not any(k in row_label for k in label_keywords):
+                continue
 
-            for c in data_cells:
+            # 先頭は項目名なので除外
+            for c in cells[1:]:
                 s = re.sub(r"[^\d\.\-]", "", c.text_content())
                 if s not in ("", "-", ".", "-."):
                     try:
-                        return float(s)
+                        v = float(s)
+                        if v > 0:
+                            return v
                     except Exception:
                         pass
 
@@ -459,19 +459,16 @@ def kabu_equity_ratio_pct(code):
             pass
         return ""
 
-    # 1) 株探 財務ページ: 直接%を拾う
     url_f = KABU_FINANCE.format(code=code)
     xps_f = [
         "//th[contains(.,'自己資本比率')]/following-sibling::td[1]",
         "//tr[.//*[contains(normalize-space(.),'自己資本比率')]]/*[self::td][1]",
         "//*[contains(text(),'自己資本比率')]/following::td[1]",
-        "//*[contains(text(),'自己資本比率')]/ancestor::*[self::tr or self::li or self::dl or self::div][1]/*[self::td or self::dd][1]",
     ]
     v = _try_xpaths(url_f, xps_f)
     if v != "":
         return v
 
-    # 2) 株探 概要ページ
     url_o = KABU_OVERVIEW.format(code=code)
     xps_o = [
         "//*[contains(text(),'自己資本比率')][1]/following::text()[1]",
@@ -481,7 +478,6 @@ def kabu_equity_ratio_pct(code):
     if v != "":
         return v
 
-    # 3) 正規表現（財務→概要）
     v = _try_regex(url_f)
     if v != "":
         return v
@@ -489,8 +485,8 @@ def kabu_equity_ratio_pct(code):
     if v != "":
         return v
 
-    # 4) 計算フォールバック
-    equity = _kabu_pick_latest_number(url_f, ["自己資本", "純資産", "株主資本"])
+    # 計算フォールバック
+    equity = _kabu_pick_latest_number(url_f, ["自己資本", "株主資本"])
     assets = _kabu_pick_latest_number(url_f, ["総資産", "資産合計", "資産総額"])
     if equity != "" and assets != "":
         try:
@@ -498,17 +494,14 @@ def kabu_equity_ratio_pct(code):
             assets = float(assets)
             if assets > 0:
                 ratio = equity / assets * 100.0
-                # 自己資本比率として不自然な値を弾く
                 if 0 <= ratio <= 100:
                     return str(round(ratio, 2))
         except Exception:
             pass
 
-    # 5) IRBANK HTML でも一応トライ
     url_ir = IR_HTML.format(code=code)
     xps_ir = [
         "(//*[contains(text(),'自己資本比率')])[1]/following::text()[1]",
-        "//*[contains(text(),'自己資本比率')]/ancestor::*[self::tr or self::li or self::dl or self::div][1]/*[self::td or self::dd][1]",
     ]
     v = _try_xpaths(url_ir, xps_ir)
     if v != "":
@@ -727,56 +720,74 @@ def stooq_closes_any(code):
     return []
 
 def kabutan_closes_any(code):
-    """株探『過去の株価』の表から終値列を集める（最新が先頭行の想定）。"""
+    """株探『過去の株価』から終値列だけを安全に集める。返り値は先頭が最新。"""
     closes = []
     page = 1
+
     while len(closes) < 25 and page <= 5:
         url = KABU_KABUKA.format(code=code, page=page)
         try:
             r = requests.get(url, headers=_headers(), timeout=25)
-            if r.status_code == 200 and r.text:
-                doc = LH.fromstring(r.text)
-                tables = doc.xpath("//table[contains(@class,'stock_kabuka') or contains(@class,'kabuka')]")
-                found = False
-
-                for tb in tables:
-                    rows = tb.xpath(".//tr")
-                    if not rows:
-                        continue
-
-                    header_cells = rows[0].xpath("./th|./td")
-                    headers = [re.sub(r"\s+", " ", c.text_content().strip()) for c in header_cells]
-
-                    close_idx = None
-                    for idx, h in enumerate(headers):
-                        if h in ("終値", "終値(円)", "終値（円）") or "終値" in h:
-                            close_idx = idx
-                            break
-
-                    if close_idx is None:
-                        print(f"[WARN] Kabutan closes: close column not found on page {page} for {code} headers={headers}", flush=True)
-                        continue
-
-                    for tr in rows[1:]:
-                        tds = [re.sub(r"\s+", " ", td.text_content().strip()) for td in tr.xpath("./td")]
-                        if len(tds) <= close_idx:
-                            continue
-
-                        ctxt = tds[close_idx]
-                        cnum = re.sub(r"[^\d.\-]", "", ctxt)
-                        if cnum not in ("", "-", ".", "-."):
-                            try:
-                                closes.append(float(cnum))
-                                found = True
-                            except Exception:
-                                pass
-
-                if not found:
-                    print(f"[WARN] Kabutan closes: table not parsed on page {page} for {code}", flush=True)
-            else:
+            if r.status_code != 200 or not r.text:
                 print(f"[WARN] HTML HTTP {r.status_code}: {url}", flush=True)
+                page += 1
+                polite_sleep(1.0)
+                continue
+
+            doc = LH.fromstring(r.text)
+            tables = doc.xpath("//table[contains(@class,'stock_kabuka') or contains(@class,'kabuka') or .//th[contains(.,'終値')]]")
+            found = False
+
+            for tb in tables:
+                rows = tb.xpath(".//tr")
+                if not rows:
+                    continue
+
+                header_idx = None
+                close_idx = None
+
+                # 「終値」を含む行をヘッダーとして採用
+                for ridx, tr in enumerate(rows):
+                    cells = tr.xpath("./th|./td")
+                    headers = [re.sub(r"\s+", " ", c.text_content().strip()) for c in cells]
+                    if any("終値" in h for h in headers):
+                        header_idx = ridx
+                        for idx, h in enumerate(headers):
+                            if "終値" in h:
+                                close_idx = idx
+                                break
+                        break
+
+                if header_idx is None or close_idx is None:
+                    continue
+
+                for tr in rows[header_idx + 1:]:
+                    tds = [re.sub(r"\s+", " ", td.text_content().strip()) for td in tr.xpath("./td")]
+                    if len(tds) <= close_idx:
+                        continue
+
+                    # 日付行っぽくない行は飛ばす
+                    if not re.search(r"\d{2,4}[/-]\d{1,2}[/-]\d{1,2}", tds[0]) and not re.search(r"\d{1,2}/\d{1,2}", tds[0]):
+                        continue
+
+                    ctxt = tds[close_idx]
+                    cnum = re.sub(r"[^\d.\-]", "", ctxt)
+                    if cnum not in ("", "-", ".", "-."):
+                        try:
+                            v = float(cnum)
+                            # 終値として不自然な値は飛ばす
+                            if v > 0:
+                                closes.append(v)
+                                found = True
+                        except Exception:
+                            pass
+
+            if not found:
+                print(f"[WARN] Kabutan closes: table not parsed on page {page} for {code}", flush=True)
+
         except Exception as e:
             print(f"[ERR] Kabutan closes fetch {url} -> {e}", flush=True)
+
         page += 1
         polite_sleep(1.0)
 
@@ -785,11 +796,11 @@ def kabutan_closes_any(code):
 def calc_deviation_25ma(code):
     """
     25MA乖離率[%] = (直近終値 / 直近25日終値平均 - 1) * 100
-    まずStooqを試し、怪しければ株探へフォールバック。
+    Stooqが怪しければ株探へフォールバック。
     """
     closes = stooq_closes_any(code)
     if len(closes) >= 25:
-        recent_25 = closes[-25:]   # Stooqは末尾が最新
+        recent_25 = closes[-25:]
         last = recent_25[-1]
         ma25 = sum(recent_25) / 25.0
 
@@ -797,14 +808,13 @@ def calc_deviation_25ma(code):
 
         if ma25 > 0:
             dev = (last / ma25 - 1.0) * 100.0
-            # 異常値ガード
             if -80 <= dev <= 80:
                 return str(round(dev, 4))
             print(f"[WARN] 25MA deviation looks abnormal for {code} from stooq: {dev}", flush=True)
 
     closes = kabutan_closes_any(code)
     if len(closes) >= 25:
-        recent_25 = closes[:25]    # 株探は先頭が最新
+        recent_25 = closes[:25]
         last = recent_25[0]
         ma25 = sum(recent_25) / 25.0
 
@@ -856,6 +866,7 @@ def main():
         pbr      = kabu_pbr(code) or ir_pbr(code) or ""
         roe_pct  = kabu_roe_pct(code) or (str(roe_pct_calc) if roe_pct_calc != "" else "")
         eqr_pct  = kabu_equity_ratio_pct(code) or (str(eqr_pct_calc) if eqr_pct_calc != "" else "")
+        print(f"[DEBUG-EQR] {code} eqr%={eqr_pct} eq={eq} assets={assets} eqr_pct_calc={eqr_pct_calc}", flush=True)
         divy_pct = kabu_divy_pct(code)
         credit   = kabu_credit(code) or ir_credit(code) or ""
 
