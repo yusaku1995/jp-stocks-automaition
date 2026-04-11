@@ -77,8 +77,8 @@ def _norm_label(s):
 EPS_KEYS=["EPS","EPS(円)","EPS（円）","1株当たり利益","1株当たり当期純利益","1株当たり当期純利益(円)","1株当たり当期純利益（円）","1株当たり純利益"]
 BPS_KEYS=["BPS","BPS(円)","BPS（円）","1株当たり純資産","1株当たり純資産(円)","1株当たり純資産（円）","1株純資産"]
 DPS_KEYS=["1株配当","1株配当金","配当金","配当(円)","配当（円）","1株当たり配当金"]
-EQ_KEYS =["自己資本","自己資本合計","株主資本","株主資本合計","純資産","純資産合計"]
-AS_KEYS =["総資産","資産合計","資産総額"]
+EQ_KEYS = ["自己資本","自己資本合計","株主資本","株主資本合計","純資産","純資産合計","純資産の部合計"]
+AS_KEYS = ["総資産","資産合計","資産総額","資産の部合計"]
 NI_KEYS =["当期純利益","親会社株主に帰属する当期純利益","純利益"]
 
 def row_index_by_keys(rows, keys):
@@ -417,6 +417,7 @@ def _kabu_pick_latest_number(url, label_keywords):
             if not texts:
                 continue
 
+            # 先頭セルだけを項目名として判定
             row_label = texts[0]
             if not any(k in row_label for k in label_keywords):
                 continue
@@ -735,7 +736,7 @@ def kabutan_closes_any(code):
                 continue
 
             doc = LH.fromstring(r.text)
-            tables = doc.xpath("//table[contains(@class,'stock_kabuka') or contains(@class,'kabuka') or .//th[contains(.,'終値')]]")
+            tables = doc.xpath("//table")
             found = False
 
             for tb in tables:
@@ -746,10 +747,9 @@ def kabutan_closes_any(code):
                 header_idx = None
                 close_idx = None
 
-                # 「終値」を含む行をヘッダーとして採用
-                for ridx, tr in enumerate(rows):
+                for ridx, tr in enumerate(rows[:5]):  # 最初の数行だけヘッダー候補として見る
                     cells = tr.xpath("./th|./td")
-                    headers = [re.sub(r"\s+", " ", c.text_content().strip()) for c in cells]
+                    headers = [re.sub(r'\s+', ' ', c.text_content().strip()) for c in cells]
                     if any("終値" in h for h in headers):
                         header_idx = ridx
                         for idx, h in enumerate(headers):
@@ -762,12 +762,8 @@ def kabutan_closes_any(code):
                     continue
 
                 for tr in rows[header_idx + 1:]:
-                    tds = [re.sub(r"\s+", " ", td.text_content().strip()) for td in tr.xpath("./td")]
+                    tds = [re.sub(r'\s+', ' ', td.text_content().strip()) for td in tr.xpath("./td")]
                     if len(tds) <= close_idx:
-                        continue
-
-                    # 日付行っぽくない行は飛ばす
-                    if not re.search(r"\d{2,4}[/-]\d{1,2}[/-]\d{1,2}", tds[0]) and not re.search(r"\d{1,2}/\d{1,2}", tds[0]):
                         continue
 
                     ctxt = tds[close_idx]
@@ -775,7 +771,6 @@ def kabutan_closes_any(code):
                     if cnum not in ("", "-", ".", "-."):
                         try:
                             v = float(cnum)
-                            # 終値として不自然な値は飛ばす
                             if v > 0:
                                 closes.append(v)
                                 found = True
