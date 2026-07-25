@@ -25,6 +25,7 @@ import sys
 import tempfile
 import time
 import unicodedata
+from html import unescape
 import zipfile
 from datetime import date, datetime, time as dt_time, timedelta
 from pathlib import Path
@@ -36,21 +37,24 @@ import exchange_calendars as xcals
 import pandas as pd
 import requests
 import yfinance as yf
+import pdfplumber
 from bs4 import BeautifulSoup
 
-SCRIPT_VERSION = "YAHOO_FREE_R4_20260725"
+SCRIPT_VERSION = "YAHOO_FREE_R5_20260725"
 
 
 
 # ====== 設定 ======
 IR_CSV = "https://f.irbank.net/files/{code}/{path}"
 JPX_MARGIN_PAGE = "https://www.jpx.co.jp/markets/statistics-equities/margin/05.html"
+JPX_MARGIN_PAGE_EN = "https://www.jpx.co.jp/english/markets/statistics-equities/margin/05.html"
 
 CSV_PL = "fy-profit-and-loss.csv"
 CSV_BS = "fy-balance-sheet.csv"
 CSV_DIV = "fy-stock-dividend.csv"
 CSV_QQ = "qq-yoy-operating-income.csv"
 CSV_PS = "fy-per-share.csv"
+CSV_ALL = "fy-data-all.csv"
 
 OUTPUT_COLUMNS = [
     "code",
@@ -117,17 +121,26 @@ def safe_float(value: Any) -> float | None:
     except (TypeError, ValueError):
         pass
 
-    text = unicodedata.normalize("NFKC", str(value))
-    text = text.replace(",", "").strip()
-    text = re.sub(r"[％%円¥倍株]", "", text)
-    if text in {"", "-", "--", "---", "None", "null", "nan", "NaN"}:
+    text = unicodedata.normalize("NFKC", str(value)).strip()
+    if text in {"", "-", "--", "---", "None", "null", "nan", "NaN", "－", "―"}:
+        return None
+
+    negative = text.startswith(("△", "▲")) or (
+        text.startswith("(") and text.endswith(")")
+    )
+    text = text.replace(",", "")
+    text = text.replace("△", "-").replace("▲", "-")
+    match = re.search(r"[-+]?\d+(?:\.\d+)?", text)
+    if not match:
         return None
 
     try:
-        number = float(text)
+        number = float(match.group(0))
     except (TypeError, ValueError):
         return None
 
+    if negative and number > 0:
+        number = -number
     return number if math.isfinite(number) else None
 
 
@@ -351,6 +364,8 @@ BPS_KEYS = [
     "1株純資産",
 ]
 DPS_KEYS = [
+    "DPS",
+    "年間配当",
     "1株配当",
     "1株配当金",
     "配当金",
@@ -368,36 +383,72 @@ EQ_KEYS = [
     "純資産の部合計",
 ]
 AS_KEYS = ["総資産", "資産合計", "資産総額", "資産の部合計"]
-NI_KEYS = ["当期純利益", "親会社株主に帰属する当期純利益", "純利益"]
+NI_KEYS = [
+    "当期純利益",
+    "親会社株主に帰属する当期純利益",
+    "親会社株主に帰属する純利益",
+    "純利益",
+]
+ROE_KEYS = ["ROE", "自己資本利益率"]
+EQR_KEYS = ["自己資本比率"]
 
 
-def row_index_by_keys(rows: list[list[str]] | None, keys: list[str]) -> int | None:
+def _label_matches(value: Any, keys: list[str]) -> bool:
+    heading = _norm_label(value)
+    if not heading:
+        return False
+    normalized_keys = [_norm_label(key) for key in keys]
+    # 見出しがキーを含む場合だけ一致とする。
+    # 逆方向（見出しがキーの一部）は、純利益→EPSや
+    # 自己資本→自己資本比率の誤一致を起こすため使わない。
+    return any(
+        key and (key == heading or key in heading)
+        for key in normalized_keys
+    )
+
+
+def metric_value(
+    rows: list[list[str]] | None,
+    keys: list[str],
+) -> float | None:
+    """
+    IRBANK CSVの両レイアウトに対応する。
+
+    A: 項目が縦
+       項目,2024,2025
+       EPS,20,30
+
+    B: 年度が縦
+       年度,売上高,純利益,EPS
+       2024,100,10,20
+       2025,120,15,30
+    """
     if not rows:
         return None
 
-    normalized_keys = [_norm_label(key) for key in keys]
-    for index, row in enumerate(rows):
-        if not row:
+    # A: 項目が縦に並ぶ形式
+    for row in rows:
+        if not row or not _label_matches(row[0], keys):
             continue
-        heading = _norm_label(row[0])
-        if not heading:
-            continue
-        if any(key and (key in heading or heading in key) for key in normalized_keys):
-            return index
-    return None
+        for value in reversed(row[1:]):
+            number = safe_float(value)
+            if number is not None:
+                return number
 
+    # B: 項目がヘッダー列に並ぶ形式
+    header_limit = min(6, len(rows))
+    for header_index in range(header_limit):
+        header = rows[header_index]
+        for column, value in enumerate(header):
+            if not _label_matches(value, keys):
+                continue
+            for data_row in reversed(rows[header_index + 1:]):
+                if column >= len(data_row):
+                    continue
+                number = safe_float(data_row[column])
+                if number is not None:
+                    return number
 
-def last_num_in_row(
-    rows: list[list[str]] | None,
-    row_index: int | None,
-) -> float | None:
-    if not rows or row_index is None:
-        return None
-
-    for value in reversed(rows[row_index][1:]):
-        number = safe_float(value)
-        if number is not None:
-            return number
     return None
 
 
@@ -418,7 +469,8 @@ def get_csv(code: str, path: str) -> list[list[str]] | None:
                     flush=True,
                 )
             else:
-                response.encoding = response.apparent_encoding or "utf-8"
+                # IRBANKのCSVはUTF-8。apparent_encodingの誤判定を避ける。
+                response.encoding = "utf-8-sig"
                 rows = list(csv.reader(io.StringIO(response.text)))
                 if len(rows) >= 2:
                     print(f"[OK] {url} rows={len(rows)}", flush=True)
@@ -437,30 +489,67 @@ def get_csv(code: str, path: str) -> list[list[str]] | None:
     return None
 
 
-def fetch_eps_bps_profit_equity_assets_dps(
-    code: str,
-) -> tuple[float | None, float | None, float | None, float | None, float | None, float | None]:
+def _first_available_metric(
+    sources: list[list[list[str]] | None],
+    keys: list[str],
+) -> float | None:
+    for rows in sources:
+        value = metric_value(rows, keys)
+        if value is not None:
+            return value
+    return None
+
+
+def fetch_financial_values(code: str) -> dict[str, float | None]:
     pl = get_csv(code, CSV_PL)
     bs = get_csv(code, CSV_BS)
     dividend = get_csv(code, CSV_DIV)
     per_share = get_csv(code, CSV_PS)
 
-    eps = last_num_in_row(pl, row_index_by_keys(pl, EPS_KEYS))
-    profit = last_num_in_row(pl, row_index_by_keys(pl, NI_KEYS))
-    if eps is None:
-        eps = last_num_in_row(per_share, row_index_by_keys(per_share, EPS_KEYS))
+    # 個別CSVにない項目を一括CSVで補完する。必要なときだけ1回取得。
+    need_all = any(
+        value is None
+        for value in (
+            metric_value(pl, EPS_KEYS),
+            metric_value(pl, NI_KEYS),
+            metric_value(bs, BPS_KEYS),
+            metric_value(bs, EQ_KEYS),
+            metric_value(bs, AS_KEYS),
+            metric_value(dividend, DPS_KEYS),
+        )
+    )
+    all_rows = get_csv(code, CSV_ALL) if need_all else None
 
-    bps = last_num_in_row(bs, row_index_by_keys(bs, BPS_KEYS))
-    equity = last_num_in_row(bs, row_index_by_keys(bs, EQ_KEYS))
-    assets = last_num_in_row(bs, row_index_by_keys(bs, AS_KEYS))
-    if bps is None:
-        bps = last_num_in_row(per_share, row_index_by_keys(per_share, BPS_KEYS))
+    eps = _first_available_metric([pl, per_share, all_rows], EPS_KEYS)
+    bps = _first_available_metric([bs, per_share, all_rows], BPS_KEYS)
+    profit = _first_available_metric([pl, all_rows], NI_KEYS)
+    equity = _first_available_metric([bs, all_rows], EQ_KEYS)
+    assets = _first_available_metric([bs, all_rows], AS_KEYS)
+    dps = _first_available_metric([dividend, per_share, all_rows], DPS_KEYS)
+    roe_pct = _first_available_metric([pl, all_rows], ROE_KEYS)
+    equity_ratio_pct = _first_available_metric([bs, all_rows], EQR_KEYS)
 
-    dps = last_num_in_row(dividend, row_index_by_keys(dividend, DPS_KEYS))
-    if dps is None:
-        dps = last_num_in_row(per_share, row_index_by_keys(per_share, DPS_KEYS))
-
-    return eps, bps, profit, equity, assets, dps
+    found = {
+        "eps": eps,
+        "bps": bps,
+        "profit": profit,
+        "equity": equity,
+        "assets": assets,
+        "dps": dps,
+        "roe_pct": roe_pct,
+        "equity_ratio_pct": equity_ratio_pct,
+    }
+    print(
+        "[DEBUG-IRBANK] "
+        + code
+        + " "
+        + " ".join(
+            f"{key}={'yes' if value is not None else 'no'}"
+            for key, value in found.items()
+        ),
+        flush=True,
+    )
+    return found
 
 
 def fetch_opinc_yoy(code: str) -> float | None:
@@ -468,10 +557,18 @@ def fetch_opinc_yoy(code: str) -> float | None:
     if not rows:
         return None
 
-    # 旧コードとの互換を優先し、最新行の2列目から先にある最初の数値を返す。
+    # 専用CSVも縦横両レイアウトに対応。
+    value = metric_value(
+        rows,
+        ["営業利益前年同期比", "営業利益前年比", "前年同期比", "前年比"],
+    )
+    if value is not None:
+        return value
+
+    # 旧形式: 最新行の2列目以降に前年比だけが入る形式。
     for row in reversed(rows[1:]):
-        for value in row[1:]:
-            number = safe_float(value)
+        for cell in row[1:]:
+            number = safe_float(cell)
             if number is not None:
                 return number
     return None
@@ -488,89 +585,295 @@ def _parse_date_score(text: str) -> int:
         match = re.search(pattern, normalized)
         if match:
             try:
-                return int(date(int(match.group(1)), int(match.group(2)), int(match.group(3))).strftime("%Y%m%d"))
+                parsed = date(
+                    int(match.group(1)),
+                    int(match.group(2)),
+                    int(match.group(3)),
+                )
+                return int(parsed.strftime("%Y%m%d"))
             except ValueError:
                 pass
     return 0
 
 
-def discover_jpx_margin_file() -> str:
-    if JPX_MARGIN_URL_OVERRIDE:
-        return JPX_MARGIN_URL_OVERRIDE
+def _clean_embedded_url(value: str, base_url: str) -> str:
+    cleaned = unescape(value.strip().strip("'\""))
+    cleaned = cleaned.replace("\\/", "/")
+    cleaned = re.sub(
+        r"\\u002[fF]",
+        "/",
+        cleaned,
+    )
+    cleaned = cleaned.rstrip("\\")
+    return urljoin(base_url, cleaned)
 
-    response = SESSION.get(JPX_MARGIN_PAGE, timeout=REQUEST_TIMEOUT)
-    response.raise_for_status()
-    soup = BeautifulSoup(response.text, "html.parser")
 
-    candidates: list[tuple[int, int, str]] = []
-    preferred_extensions = {".xlsx": 5, ".xls": 4, ".csv": 3, ".zip": 2}
+def _candidate_urls_from_html(
+    html_text: str,
+    base_url: str,
+) -> list[tuple[int, int, str]]:
+    soup = BeautifulSoup(html_text, "html.parser")
+    raw_candidates: list[tuple[str, str, int]] = []
 
-    for order, anchor in enumerate(soup.find_all("a", href=True)):
-        href = anchor.get("href", "").strip()
-        absolute_url = urljoin(JPX_MARGIN_PAGE, href)
-        clean_path = absolute_url.split("?", 1)[0].lower()
-        extension = next(
-            (ext for ext in preferred_extensions if clean_path.endswith(ext)),
-            None,
-        )
-        if extension is None:
-            continue
-
+    # hrefだけでなく、JavaScript用のdata属性やonclickも調べる。
+    attribute_names = (
+        "href",
+        "src",
+        "data-href",
+        "data-url",
+        "data-download",
+        "data-file",
+        "onclick",
+    )
+    for order, tag in enumerate(soup.find_all(True)):
         context = " ".join(
             [
-                anchor.get_text(" ", strip=True),
-                href,
-                anchor.parent.get_text(" ", strip=True) if anchor.parent else "",
+                tag.get_text(" ", strip=True),
+                tag.parent.get_text(" ", strip=True) if tag.parent else "",
             ]
         )
-        date_score = _parse_date_score(context)
-        candidates.append((date_score, preferred_extensions[extension] * 10000 + order, absolute_url))
+        for attribute in attribute_names:
+            value = tag.get(attribute)
+            if not value:
+                continue
+            raw_candidates.append((str(value), context, order))
 
-    if not candidates:
-        raise RuntimeError("JPXページから信用残高のExcel/CSVリンクを発見できませんでした")
+    # HTMLや埋め込みJSONに直接書かれたファイルパスも拾う。
+    normalized_html = unescape(html_text).replace("\\/", "/")
+    normalized_html = re.sub(r"\\u002[fF]", "/", normalized_html)
+    file_pattern = re.compile(
+        r"""(?P<url>
+            https?://[^\s"'<>]+
+            |
+            /[^\s"'<>]+
+            |
+            (?:\.\./|\.?/)[^\s"'<>]+
+        )""",
+        re.VERBOSE | re.IGNORECASE,
+    )
+    for order, match in enumerate(file_pattern.finditer(normalized_html), start=100000):
+        raw_candidates.append((match.group("url"), "", order))
 
-    candidates.sort()
-    return candidates[-1][2]
+    extension_scores = {
+        ".xlsx": 80,
+        ".xls": 70,
+        ".csv": 60,
+        ".zip": 50,
+        ".pdf": 40,
+    }
+    result: list[tuple[int, int, str]] = []
+    seen: set[str] = set()
+
+    for raw_url, context, order in raw_candidates:
+        # onclick等の中からURL部分だけ再抽出
+        possible_values = [raw_url]
+        possible_values.extend(
+            re.findall(
+                r"""["']([^"']+)["']""",
+                raw_url,
+            )
+        )
+
+        for possible in possible_values:
+            url = _clean_embedded_url(possible, base_url)
+            if not url.startswith(("http://", "https://")):
+                continue
+            if url in seen:
+                continue
+
+            lower = url.split("?", 1)[0].lower()
+            extension = next(
+                (ext for ext in extension_scores if lower.endswith(ext)),
+                "",
+            )
+            combined = f"{context} {url}"
+            date_score = _parse_date_score(combined)
+
+            margin_score = 0
+            normalized_context = _norm_label(combined)
+            if any(
+                key in normalized_context
+                for key in (
+                    "信用取引週末残高",
+                    "銘柄別信用",
+                    "margin",
+                    "申込分",
+                    "applicationbased",
+                )
+            ):
+                margin_score += 100
+
+            # 拡張子なしでも日付リンクやダウンロード属性なら候補に残す。
+            if not extension and date_score == 0 and margin_score == 0:
+                continue
+
+            seen.add(url)
+            result.append(
+                (
+                    date_score,
+                    margin_score + extension_scores.get(extension, 10),
+                    url,
+                )
+            )
+
+    return result
 
 
-def _read_jpx_payload(url: str, content: bytes) -> list[pd.DataFrame]:
+def discover_jpx_margin_candidates() -> list[str]:
+    if JPX_MARGIN_URL_OVERRIDE:
+        return [JPX_MARGIN_URL_OVERRIDE]
+
+    all_candidates: list[tuple[int, int, str]] = []
+    visited_pages: set[str] = set()
+    page_queue = [JPX_MARGIN_PAGE, JPX_MARGIN_PAGE_EN]
+
+    # JPXページはJavaScript生成の場合があるため、iframe先も1階層だけ確認。
+    while page_queue and len(visited_pages) < 8:
+        page_url = page_queue.pop(0)
+        if page_url in visited_pages:
+            continue
+        visited_pages.add(page_url)
+
+        response = SESSION.get(page_url, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        all_candidates.extend(
+            _candidate_urls_from_html(response.text, page_url)
+        )
+
+        soup = BeautifulSoup(response.text, "html.parser")
+        for iframe in soup.find_all("iframe", src=True):
+            iframe_url = urljoin(page_url, iframe.get("src", ""))
+            if iframe_url.startswith("https://www.jpx.co.jp/"):
+                page_queue.append(iframe_url)
+
+    if not all_candidates:
+        raise RuntimeError(
+            "JPXページから信用残高のダウンロード候補を発見できませんでした"
+        )
+
+    all_candidates.sort(reverse=True)
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for _, _, url in all_candidates:
+        if url not in seen:
+            ordered.append(url)
+            seen.add(url)
+    return ordered
+
+
+def _payload_kind(url: str, content_type: str, content: bytes) -> str:
     lower_url = url.split("?", 1)[0].lower()
+    lower_type = content_type.lower()
+
+    if content.startswith(b"%PDF") or "application/pdf" in lower_type or lower_url.endswith(".pdf"):
+        return "pdf"
+    if content.startswith(b"\xD0\xCF\x11\xE0") or lower_url.endswith(".xls"):
+        return "excel"
+    if content.startswith(b"PK\x03\x04"):
+        try:
+            with zipfile.ZipFile(io.BytesIO(content)) as archive:
+                names = set(archive.namelist())
+                if "[Content_Types].xml" in names and any(
+                    name.startswith("xl/") for name in names
+                ):
+                    return "excel"
+        except Exception:
+            pass
+        return "zip"
+    if (
+        "csv" in lower_type
+        or lower_url.endswith(".csv")
+        or content[:200].count(b",") >= 2
+    ):
+        return "csv"
+    if "spreadsheet" in lower_type or "excel" in lower_type or lower_url.endswith(".xlsx"):
+        return "excel"
+    return "unknown"
+
+
+def _read_pdf_tables(content: bytes) -> list[pd.DataFrame]:
+    frames: list[pd.DataFrame] = []
+    with pdfplumber.open(io.BytesIO(content)) as pdf:
+        for page in pdf.pages:
+            for table in page.extract_tables() or []:
+                if table:
+                    frames.append(pd.DataFrame(table))
+    return frames
+
+
+def _read_jpx_payload(
+    url: str,
+    content_type: str,
+    content: bytes,
+) -> list[pd.DataFrame]:
+    kind = _payload_kind(url, content_type, content)
     frames: list[pd.DataFrame] = []
 
-    if lower_url.endswith(".csv"):
+    if kind == "csv":
         for encoding in ("cp932", "utf-8-sig", "utf-8"):
             try:
-                frames.append(pd.read_csv(io.BytesIO(content), header=None, encoding=encoding))
+                frames.append(
+                    pd.read_csv(
+                        io.BytesIO(content),
+                        header=None,
+                        encoding=encoding,
+                    )
+                )
                 return frames
             except Exception:
                 continue
         raise RuntimeError("JPX CSVを読み込めませんでした")
 
-    if lower_url.endswith(".zip"):
+    if kind == "pdf":
+        return _read_pdf_tables(content)
+
+    if kind == "zip":
         with zipfile.ZipFile(io.BytesIO(content)) as archive:
             for name in archive.namelist():
-                if name.lower().endswith((".xlsx", ".xls")):
-                    payload = archive.read(name)
-                    excel = pd.read_excel(io.BytesIO(payload), sheet_name=None, header=None)
+                payload = archive.read(name)
+                lower_name = name.lower()
+                if lower_name.endswith((".xlsx", ".xls")):
+                    excel = pd.read_excel(
+                        io.BytesIO(payload),
+                        sheet_name=None,
+                        header=None,
+                    )
                     frames.extend(excel.values())
-                elif name.lower().endswith(".csv"):
-                    payload = archive.read(name)
+                elif lower_name.endswith(".csv"):
                     for encoding in ("cp932", "utf-8-sig", "utf-8"):
                         try:
-                            frames.append(pd.read_csv(io.BytesIO(payload), header=None, encoding=encoding))
+                            frames.append(
+                                pd.read_csv(
+                                    io.BytesIO(payload),
+                                    header=None,
+                                    encoding=encoding,
+                                )
+                            )
                             break
                         except Exception:
                             continue
+                elif lower_name.endswith(".pdf"):
+                    frames.extend(_read_pdf_tables(payload))
         return frames
 
-    excel = pd.read_excel(io.BytesIO(content), sheet_name=None, header=None)
-    frames.extend(excel.values())
-    return frames
+    if kind == "excel":
+        excel = pd.read_excel(
+            io.BytesIO(content),
+            sheet_name=None,
+            header=None,
+        )
+        frames.extend(excel.values())
+        return frames
+
+    raise RuntimeError(
+        f"JPX候補のファイル形式を判定できません: "
+        f"content-type={content_type or 'unknown'} url={url}"
+    )
 
 
 def _header_text(frame: pd.DataFrame, row: int, column: int) -> str:
     parts: list[str] = []
-    for offset in range(3, -1, -1):
+    for offset in range(4, -1, -1):
         source_row = row - offset
         if source_row < 0:
             continue
@@ -583,50 +886,88 @@ def _header_text(frame: pd.DataFrame, row: int, column: int) -> str:
     return "".join(parts)
 
 
-def _find_jpx_columns(frame: pd.DataFrame) -> tuple[int, int, int, int] | None:
-    max_header_rows = min(30, len(frame))
+def _find_jpx_columns(
+    frame: pd.DataFrame,
+) -> tuple[int, int, int, int] | None:
+    max_header_rows = min(50, len(frame))
 
     for row in range(max_header_rows):
-        headers = [_header_text(frame, row, col) for col in range(frame.shape[1])]
+        headers = [
+            _header_text(frame, row, col)
+            for col in range(frame.shape[1])
+        ]
 
         code_candidates = [
-            col for col, text in enumerate(headers)
-            if "銘柄コード" in text or text.endswith("コード") or text == "コード"
+            col
+            for col, value in enumerate(headers)
+            if (
+                "銘柄コード" in value
+                or value.endswith("コード")
+                or value == "コード"
+                or value.lower().endswith("code")
+            )
         ]
         short_candidates = [
-            col for col, text in enumerate(headers)
-            if any(key in text for key in ("売残高", "売残", "売り残高", "売り残"))
+            col
+            for col, value in enumerate(headers)
+            if any(
+                key in value
+                for key in (
+                    "売残高",
+                    "売残",
+                    "売り残高",
+                    "売り残",
+                    "short",
+                )
+            )
         ]
         long_candidates = [
-            col for col, text in enumerate(headers)
-            if any(key in text for key in ("買残高", "買残", "買い残高", "買い残"))
+            col
+            for col, value in enumerate(headers)
+            if any(
+                key in value
+                for key in (
+                    "買残高",
+                    "買残",
+                    "買い残高",
+                    "買い残",
+                    "long",
+                )
+            )
         ]
 
         if not code_candidates or not short_candidates or not long_candidates:
             continue
 
         def column_score(column: int, side: str) -> tuple[int, int]:
-            text = headers[column]
+            value = headers[column]
             score = 0
-            if "合計" in text or "総" in text:
-                score += 20
-            if side == "short" and text.endswith(("売残高", "売残")):
+            if "合計" in value or "総" in value or "total" in value.lower():
+                score += 30
+            if side == "short" and value.endswith(("売残高", "売残")):
                 score += 10
-            if side == "long" and text.endswith(("買残高", "買残")):
+            if side == "long" and value.endswith(("買残高", "買残")):
                 score += 10
-            if "制度" in text or "一般" in text:
+            if "制度" in value or "一般" in value:
                 score -= 5
             return score, column
 
         code_col = code_candidates[0]
-        short_col = max(short_candidates, key=lambda col: column_score(col, "short"))
-        long_col = max(long_candidates, key=lambda col: column_score(col, "long"))
+        short_col = max(
+            short_candidates,
+            key=lambda col: column_score(col, "short"),
+        )
+        long_col = max(
+            long_candidates,
+            key=lambda col: column_score(col, "long"),
+        )
         return row, code_col, short_col, long_col
 
     return None
 
 
 def _parse_jpx_frame(frame: pd.DataFrame) -> dict[str, float]:
+    frame = frame.replace({"\n": " "}, regex=True)
     columns = _find_jpx_columns(frame)
     if columns is None:
         return {}
@@ -635,7 +976,8 @@ def _parse_jpx_frame(frame: pd.DataFrame) -> dict[str, float]:
     ratios: dict[str, float] = {}
 
     for row in range(header_row + 1, len(frame)):
-        code = normalize_code_line(str(frame.iat[row, code_col]))
+        raw_code = frame.iat[row, code_col]
+        code = normalize_code_line(str(raw_code))
         if not re.fullmatch(r"[0-9A-Z]{4}", code):
             continue
 
@@ -649,26 +991,54 @@ def _parse_jpx_frame(frame: pd.DataFrame) -> dict[str, float]:
 
 
 def fetch_jpx_credit_ratios() -> tuple[dict[str, float], str]:
+    errors: list[str] = []
+
     try:
-        url = discover_jpx_margin_file()
-        response = SESSION.get(url, timeout=REQUEST_TIMEOUT)
-        response.raise_for_status()
-        frames = _read_jpx_payload(url, response.content)
+        candidates = discover_jpx_margin_candidates()
+        print(
+            f"[DEBUG-JPX] download_candidates={len(candidates)}",
+            flush=True,
+        )
 
-        best: dict[str, float] = {}
-        for frame in frames:
-            parsed = _parse_jpx_frame(frame)
-            if len(parsed) > len(best):
-                best = parsed
+        # 新しい候補から順に、実際に信用残高表として読めるものを探す。
+        for url in candidates[:30]:
+            try:
+                response = SESSION.get(url, timeout=REQUEST_TIMEOUT)
+                response.raise_for_status()
+                frames = _read_jpx_payload(
+                    url,
+                    response.headers.get("Content-Type", ""),
+                    response.content,
+                )
 
-        if not best:
-            raise RuntimeError("JPX信用残高ファイルの列を判定できませんでした")
+                best: dict[str, float] = {}
+                for frame in frames:
+                    parsed = _parse_jpx_frame(frame)
+                    if len(parsed) > len(best):
+                        best = parsed
 
-        print(f"[OK] JPX credit ratios rows={len(best)} url={url}", flush=True)
-        return best, url
+                if best:
+                    print(
+                        f"[OK] JPX credit ratios rows={len(best)} url={url}",
+                        flush=True,
+                    )
+                    return best, url
+            except Exception as exc:
+                errors.append(
+                    f"{url}: {type(exc).__name__}: {exc}"
+                )
+
+        detail = errors[-1] if errors else "解析可能な候補なし"
+        raise RuntimeError(
+            "JPX信用残高ファイルを取得・解析できませんでした。"
+            f" last={detail}"
+        )
 
     except Exception as exc:
-        message = f"JPX credit ratios unavailable: {type(exc).__name__}: {exc}"
+        message = (
+            f"JPX credit ratios unavailable: "
+            f"{type(exc).__name__}: {exc}"
+        )
         if STRICT_JPX:
             raise RuntimeError(message) from exc
         print(f"[WARN] {message}", flush=True)
@@ -699,13 +1069,29 @@ def build_row(
     credit_ratios: dict[str, float],
 ) -> list[Any]:
     latest_price = market["latest_price"]
-    eps, bps, profit, equity, assets, dps = fetch_eps_bps_profit_equity_assets_dps(code)
+    financial = fetch_financial_values(code)
 
-    per = safe_div(latest_price, eps)
-    pbr = safe_div(latest_price, bps)
-    roe_pct = safe_div(profit, equity, 100.0)
-    equity_ratio_pct = safe_div(equity, assets, 100.0)
-    dividend_yield_pct = safe_div(dps, latest_price, 100.0)
+    per = safe_div(latest_price, financial["eps"])
+    pbr = safe_div(latest_price, financial["bps"])
+    roe_pct = financial["roe_pct"]
+    if roe_pct is None:
+        roe_pct = safe_div(
+            financial["profit"],
+            financial["equity"],
+            100.0,
+        )
+    equity_ratio_pct = financial["equity_ratio_pct"]
+    if equity_ratio_pct is None:
+        equity_ratio_pct = safe_div(
+            financial["equity"],
+            financial["assets"],
+            100.0,
+        )
+    dividend_yield_pct = safe_div(
+        financial["dps"],
+        latest_price,
+        100.0,
+    )
     op_yoy = fetch_opinc_yoy(code)
     credit_ratio = credit_ratios.get(code)
 
@@ -755,7 +1141,7 @@ def write_metrics_atomically(rows: list[list[Any]]) -> None:
 
 
 def main() -> int:
-    print("[START] YAHOO_FREE_R4_20260725", flush=True)
+    print("[START] YAHOO_FREE_R5_20260725", flush=True)
     try:
         codes = read_codes()
         print(f"[CONFIG] script_version={SCRIPT_VERSION}", flush=True)
