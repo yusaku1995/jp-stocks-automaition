@@ -40,7 +40,7 @@ import yfinance as yf
 import pdfplumber
 from bs4 import BeautifulSoup
 
-SCRIPT_VERSION = "YAHOO_FREE_R5_20260725"
+SCRIPT_VERSION = "YAHOO_FREE_R6_20260725"
 
 
 
@@ -398,13 +398,78 @@ def _label_matches(value: Any, keys: list[str]) -> bool:
     if not heading:
         return False
     normalized_keys = [_norm_label(key) for key in keys]
-    # 見出しがキーを含む場合だけ一致とする。
-    # 逆方向（見出しがキーの一部）は、純利益→EPSや
-    # 自己資本→自己資本比率の誤一致を起こすため使わない。
     return any(
         key and (key == heading or key in heading)
         for key in normalized_keys
     )
+
+
+def _label_matches_exact(value: Any, keys: list[str]) -> bool:
+    heading = _norm_label(value)
+    if not heading:
+        return False
+    return heading in {_norm_label(key) for key in keys if _norm_label(key)}
+
+
+def _looks_like_period(value: Any) -> bool:
+    """
+    年度・年月・日付を財務数値として誤読しない。
+    """
+    if value is None:
+        return False
+
+    text = unicodedata.normalize("NFKC", str(value)).strip()
+    compact = re.sub(r"\s+", "", text)
+
+    if re.fullmatch(r"20\d{2}", compact):
+        return True
+    if re.search(
+        r"20\d{2}(?:[/.\-年])\d{1,2}(?:(?:[/.\-月])\d{1,2})?(?:日|期)?",
+        compact,
+    ):
+        return True
+    if re.fullmatch(r"(?:FY)?20\d{2}(?:Q[1-4]|[1-4]Q)?", compact, re.IGNORECASE):
+        return True
+    return False
+
+
+def _numeric_cell(value: Any) -> float | None:
+    if _looks_like_period(value):
+        return None
+    return safe_float(value)
+
+
+def _iter_metric_candidates(
+    rows: list[list[str]],
+    keys: list[str],
+    *,
+    exact: bool,
+):
+    matcher = _label_matches_exact if exact else _label_matches
+
+    # A: 項目が縦に並ぶ形式
+    for row in rows:
+        if not row or not matcher(row[0], keys):
+            continue
+        for value in reversed(row[1:]):
+            number = _numeric_cell(value)
+            if number is not None:
+                yield number, value
+
+    # B: 項目がヘッダー列に並ぶ形式
+    header_limit = min(8, len(rows))
+    for header_index in range(header_limit):
+        header = rows[header_index]
+        for column, heading in enumerate(header):
+            if not matcher(heading, keys):
+                continue
+            for data_row in reversed(rows[header_index + 1:]):
+                if column >= len(data_row):
+                    continue
+                value = data_row[column]
+                number = _numeric_cell(value)
+                if number is not None:
+                    yield number, value
 
 
 def metric_value(
@@ -412,45 +477,67 @@ def metric_value(
     keys: list[str],
 ) -> float | None:
     """
-    IRBANK CSVの両レイアウトに対応する。
-
-    A: 項目が縦
-       項目,2024,2025
-       EPS,20,30
-
-    B: 年度が縦
-       年度,売上高,純利益,EPS
-       2024,100,10,20
-       2025,120,15,30
+    IRBANK CSVの縦型・横型に対応。
+    完全一致を先に調べ、年度セルは採用しない。
     """
     if not rows:
         return None
 
-    # A: 項目が縦に並ぶ形式
-    for row in rows:
-        if not row or not _label_matches(row[0], keys):
-            continue
-        for value in reversed(row[1:]):
-            number = safe_float(value)
-            if number is not None:
-                return number
-
-    # B: 項目がヘッダー列に並ぶ形式
-    header_limit = min(6, len(rows))
-    for header_index in range(header_limit):
-        header = rows[header_index]
-        for column, value in enumerate(header):
-            if not _label_matches(value, keys):
-                continue
-            for data_row in reversed(rows[header_index + 1:]):
-                if column >= len(data_row):
-                    continue
-                number = safe_float(data_row[column])
-                if number is not None:
-                    return number
-
+    for exact in (True, False):
+        for number, _ in _iter_metric_candidates(rows, keys, exact=exact):
+            return number
     return None
 
+
+DIVIDEND_EXACT_KEYS = [
+    "DPS",
+    "年間配当",
+    "年間配当金",
+    "1株配当",
+    "1株配当金",
+    "1株当たり配当金",
+    "1株当たり年間配当金",
+    "配当合計",
+    "合計",
+]
+
+
+def dividend_per_share(rows: list[list[str]] | None) -> float | None:
+    """
+    配当CSV専用。
+    大見出しを年度列と誤認せず、年間合計列を優先する。
+    """
+    if not rows:
+        return None
+
+    for number, _ in _iter_metric_candidates(
+        rows,
+        DIVIDEND_EXACT_KEYS,
+        exact=True,
+    ):
+        if 0 <= number <= 100000:
+            return number
+
+    narrow_keys = [
+        "DPS",
+        "年間配当",
+        "1株配当",
+        "1株当たり配当金",
+    ]
+    for number, _ in _iter_metric_candidates(rows, narrow_keys, exact=False):
+        if 0 <= number <= 100000:
+            return number
+
+    non_period_numbers: list[float] = []
+    for row in rows:
+        for cell in row:
+            number = _numeric_cell(cell)
+            if number is not None:
+                non_period_numbers.append(number)
+    if non_period_numbers and all(number == 0 for number in non_period_numbers):
+        return 0.0
+
+    return None
 
 def get_csv(code: str, path: str) -> list[list[str]] | None:
     """数字4桁・英数字コードの両方を試す。404は欠損として扱う。"""
@@ -515,7 +602,7 @@ def fetch_financial_values(code: str) -> dict[str, float | None]:
             metric_value(bs, BPS_KEYS),
             metric_value(bs, EQ_KEYS),
             metric_value(bs, AS_KEYS),
-            metric_value(dividend, DPS_KEYS),
+            dividend_per_share(dividend),
         )
     )
     all_rows = get_csv(code, CSV_ALL) if need_all else None
@@ -525,7 +612,9 @@ def fetch_financial_values(code: str) -> dict[str, float | None]:
     profit = _first_available_metric([pl, all_rows], NI_KEYS)
     equity = _first_available_metric([bs, all_rows], EQ_KEYS)
     assets = _first_available_metric([bs, all_rows], AS_KEYS)
-    dps = _first_available_metric([dividend, per_share, all_rows], DPS_KEYS)
+    dps = dividend_per_share(dividend)
+    if dps is None:
+        dps = _first_available_metric([per_share, all_rows], DPS_KEYS)
     roe_pct = _first_available_metric([pl, all_rows], ROE_KEYS)
     equity_ratio_pct = _first_available_metric([bs, all_rows], EQR_KEYS)
 
@@ -557,20 +646,32 @@ def fetch_opinc_yoy(code: str) -> float | None:
     if not rows:
         return None
 
-    # 専用CSVも縦横両レイアウトに対応。
-    value = metric_value(
-        rows,
-        ["営業利益前年同期比", "営業利益前年比", "前年同期比", "前年比"],
-    )
-    if value is not None:
-        return value
-
-    # 旧形式: 最新行の2列目以降に前年比だけが入る形式。
+    # 専用CSVは先頭列が期間、2列目が前年比。
     for row in reversed(rows[1:]):
-        for cell in row[1:]:
-            number = safe_float(cell)
-            if number is not None:
+        if len(row) < 2:
+            continue
+        value = row[1]
+        if _looks_like_period(value):
+            continue
+        number = safe_float(value)
+        if number is not None:
+            return number
+
+    # レイアウト変更時の限定フォールバック。
+    for exact in (True, False):
+        for number, raw in _iter_metric_candidates(
+            rows,
+            [
+                "営業利益前年同期比",
+                "営業利益前年比",
+                "前年同期比",
+                "前年比",
+            ],
+            exact=exact,
+        ):
+            if not _looks_like_period(raw):
                 return number
+
     return None
 
 
@@ -608,6 +709,30 @@ def _clean_embedded_url(value: str, base_url: str) -> str:
     return urljoin(base_url, cleaned)
 
 
+STATIC_EXTENSIONS = (
+    ".css",
+    ".js",
+    ".mjs",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".svg",
+    ".webp",
+    ".ico",
+    ".woff",
+    ".woff2",
+    ".ttf",
+    ".map",
+    ".xml",
+)
+
+
+def _is_static_asset_url(url: str) -> bool:
+    path = url.split("?", 1)[0].lower()
+    return path.endswith(STATIC_EXTENSIONS)
+
+
 def _candidate_urls_from_html(
     html_text: str,
     base_url: str,
@@ -615,43 +740,48 @@ def _candidate_urls_from_html(
     soup = BeautifulSoup(html_text, "html.parser")
     raw_candidates: list[tuple[str, str, int]] = []
 
-    # hrefだけでなく、JavaScript用のdata属性やonclickも調べる。
-    attribute_names = (
-        "href",
-        "src",
-        "data-href",
-        "data-url",
-        "data-download",
-        "data-file",
-        "onclick",
-    )
-    for order, tag in enumerate(soup.find_all(True)):
-        context = " ".join(
-            [
-                tag.get_text(" ", strip=True),
-                tag.parent.get_text(" ", strip=True) if tag.parent else "",
-            ]
-        )
-        for attribute in attribute_names:
-            value = tag.get(attribute)
-            if not value:
-                continue
-            raw_candidates.append((str(value), context, order))
+    for order, tag in enumerate(
+        soup.find_all(["a", "button", "iframe", "object", "embed"])
+    ):
+        context = tag.get_text(" ", strip=True)
+        parent = tag.find_parent(["tr", "li", "section", "article", "div"])
+        if parent is not None:
+            parent_text = parent.get_text(" ", strip=True)
+            if len(parent_text) <= 500:
+                context = f"{context} {parent_text}"
 
-    # HTMLや埋め込みJSONに直接書かれたファイルパスも拾う。
+        for attribute in (
+            "href",
+            "src",
+            "data",
+            "data-href",
+            "data-url",
+            "data-download",
+            "data-file",
+            "onclick",
+        ):
+            value = tag.get(attribute)
+            if value:
+                raw_candidates.append((str(value), context, order))
+
     normalized_html = unescape(html_text).replace("\\/", "/")
     normalized_html = re.sub(r"\\u002[fF]", "/", normalized_html)
-    file_pattern = re.compile(
+    embedded_pattern = re.compile(
         r"""(?P<url>
-            https?://[^\s"'<>]+
-            |
-            /[^\s"'<>]+
-            |
-            (?:\.\./|\.?/)[^\s"'<>]+
+            (?:https?://|/|\.\.?/)
+            [^\s"'<>]+?
+            (?:
+                \.(?:xlsx?|csv|zip|pdf)(?:\?[^\s"'<>]*)?
+                |
+                (?:-att|_att)/[^\s"'<>]+
+            )
         )""",
         re.VERBOSE | re.IGNORECASE,
     )
-    for order, match in enumerate(file_pattern.finditer(normalized_html), start=100000):
+    for order, match in enumerate(
+        embedded_pattern.finditer(normalized_html),
+        start=100000,
+    ):
         raw_candidates.append((match.group("url"), "", order))
 
     extension_scores = {
@@ -661,63 +791,64 @@ def _candidate_urls_from_html(
         ".zip": 50,
         ".pdf": 40,
     }
+
     result: list[tuple[int, int, str]] = []
     seen: set[str] = set()
 
     for raw_url, context, order in raw_candidates:
-        # onclick等の中からURL部分だけ再抽出
         possible_values = [raw_url]
-        possible_values.extend(
-            re.findall(
-                r"""["']([^"']+)["']""",
-                raw_url,
-            )
-        )
+        possible_values.extend(re.findall(r"""["']([^"']+)["']""", raw_url))
 
         for possible in possible_values:
             url = _clean_embedded_url(possible, base_url)
             if not url.startswith(("http://", "https://")):
                 continue
-            if url in seen:
+            if url in seen or url.rstrip("/") == base_url.rstrip("/"):
+                continue
+            if _is_static_asset_url(url):
                 continue
 
-            lower = url.split("?", 1)[0].lower()
+            lower_path = url.split("?", 1)[0].lower()
             extension = next(
-                (ext for ext in extension_scores if lower.endswith(ext)),
+                (ext for ext in extension_scores if lower_path.endswith(ext)),
                 "",
             )
-            combined = f"{context} {url}"
-            date_score = _parse_date_score(combined)
 
-            margin_score = 0
-            normalized_context = _norm_label(combined)
-            if any(
+            normalized_context = _norm_label(f"{context} {url}")
+            has_margin_context = any(
                 key in normalized_context
                 for key in (
                     "信用取引週末残高",
                     "銘柄別信用",
-                    "margin",
-                    "申込分",
+                    "endofweekoutstandingmargin",
                     "applicationbased",
+                    "申込分",
                 )
-            ):
-                margin_score += 100
-
-            # 拡張子なしでも日付リンクやダウンロード属性なら候補に残す。
-            if not extension and date_score == 0 and margin_score == 0:
-                continue
-
-            seen.add(url)
-            result.append(
-                (
-                    date_score,
-                    margin_score + extension_scores.get(extension, 10),
-                    url,
+            )
+            has_attachment_path = any(
+                marker in lower_path
+                for marker in (
+                    "-att/",
+                    "_att/",
+                    "/download/",
+                    "/files/",
                 )
             )
 
-    return result
+            if not extension and not has_attachment_path:
+                continue
 
+            date_score = _parse_date_score(f"{context} {url}")
+            score = extension_scores.get(extension, 10)
+            if has_margin_context:
+                score += 100
+            if has_attachment_path:
+                score += 25
+
+            seen.add(url)
+            result.append((date_score, score, url))
+
+    return result
 
 def discover_jpx_margin_candidates() -> list[str]:
     if JPX_MARGIN_URL_OVERRIDE:
@@ -996,18 +1127,38 @@ def fetch_jpx_credit_ratios() -> tuple[dict[str, float], str]:
     try:
         candidates = discover_jpx_margin_candidates()
         print(
-            f"[DEBUG-JPX] download_candidates={len(candidates)}",
+            f"[DEBUG-JPX] filtered_download_candidates={len(candidates)}",
             flush=True,
         )
+        for preview in candidates[:5]:
+            print(f"[DEBUG-JPX-CANDIDATE] {preview}", flush=True)
 
-        # 新しい候補から順に、実際に信用残高表として読めるものを探す。
-        for url in candidates[:30]:
+        for url in candidates:
             try:
                 response = SESSION.get(url, timeout=REQUEST_TIMEOUT)
                 response.raise_for_status()
+
+                content_type = response.headers.get("Content-Type", "").lower()
+                if any(
+                    blocked in content_type
+                    for blocked in (
+                        "text/css",
+                        "javascript",
+                        "image/",
+                        "font/",
+                    )
+                ):
+                    continue
+                if (
+                    "text/html" in content_type
+                    and _payload_kind(url, content_type, response.content)
+                    == "unknown"
+                ):
+                    continue
+
                 frames = _read_jpx_payload(
                     url,
-                    response.headers.get("Content-Type", ""),
+                    content_type,
                     response.content,
                 )
 
@@ -1023,6 +1174,7 @@ def fetch_jpx_credit_ratios() -> tuple[dict[str, float], str]:
                         flush=True,
                     )
                     return best, url
+
             except Exception as exc:
                 errors.append(
                     f"{url}: {type(exc).__name__}: {exc}"
@@ -1092,6 +1244,15 @@ def build_row(
         latest_price,
         100.0,
     )
+    if dividend_yield_pct is not None and not (0 <= dividend_yield_pct <= 30):
+        print(
+            f"[WARN] {code} rejected abnormal dividend yield: "
+            f"dps={financial['dps']} price={latest_price} "
+            f"yield={dividend_yield_pct}",
+            flush=True,
+        )
+        dividend_yield_pct = None
+
     op_yoy = fetch_opinc_yoy(code)
     credit_ratio = credit_ratios.get(code)
 
@@ -1141,7 +1302,7 @@ def write_metrics_atomically(rows: list[list[Any]]) -> None:
 
 
 def main() -> int:
-    print("[START] YAHOO_FREE_R5_20260725", flush=True)
+    print("[START] YAHOO_FREE_R6_20260725", flush=True)
     try:
         codes = read_codes()
         print(f"[CONFIG] script_version={SCRIPT_VERSION}", flush=True)
