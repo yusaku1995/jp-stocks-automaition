@@ -40,7 +40,7 @@ import yfinance as yf
 import pdfplumber
 from bs4 import BeautifulSoup
 
-SCRIPT_VERSION = "YAHOO_FREE_R9_20260725"
+SCRIPT_VERSION = "YAHOO_FREE_R10_20260725"
 
 
 
@@ -321,31 +321,87 @@ def yahoo_metrics(
             f"expected={expected_date.isoformat()} received={latest_date.isoformat()}"
         )
 
-    closes = work["Close"]
+    raw_closes = work["Close"].copy()
     volumes = work["Volume"].fillna(0)
-    latest_price = float(closes.iloc[-1])
+
+    # YahooのCloseは株式分割前後で単位が変わることがある。
+    # Adj Closeは配当まで補正するため、25日線用には使わない。
+    # Stock Splitsだけを使い、過去の終値を現在の株数基準へ揃える。
+    split_adjusted_closes = raw_closes.copy()
+    split_events: list[tuple[str, float]] = []
+
+    if "Stock Splits" in work.columns:
+        split_factors = pd.to_numeric(
+            work["Stock Splits"],
+            errors="coerce",
+        ).fillna(0.0)
+
+        normalized_factors = split_factors.where(
+            split_factors > 0,
+            1.0,
+        )
+
+        # 各日の「翌日以降」に発生した分割倍率の累積。
+        # 分割当日の終値はすでに分割後価格なので、その日の倍率は除外する。
+        future_split_factor = (
+            normalized_factors.iloc[::-1]
+            .cumprod()
+            .iloc[::-1]
+            / normalized_factors
+        )
+
+        split_adjusted_closes = raw_closes / future_split_factor
+
+        for split_date, factor in split_factors[split_factors > 0].items():
+            split_events.append(
+                (
+                    pd.Timestamp(split_date).date().isoformat(),
+                    float(factor),
+                )
+            )
+
+    latest_price = float(raw_closes.iloc[-1])
+    latest_ma_price = float(split_adjusted_closes.iloc[-1])
+
+    # 最新日は将来の分割がないため、通常は両者が一致する。
+    if abs(latest_price - latest_ma_price) > max(0.01, latest_price * 0.001):
+        raise RuntimeError(
+            f"{code}: split adjustment changed the latest close unexpectedly "
+            f"raw={latest_price} adjusted={latest_ma_price}"
+        )
 
     vol5 = int(round(float(volumes.tail(5).mean()))) if len(volumes) >= 5 else None
     vol25 = int(round(float(volumes.tail(25).mean()))) if len(volumes) >= 25 else None
     volume_ratio = safe_div(vol5, vol25)
 
     deviation_25ma = None
-    if len(closes) >= 25:
-        ma25 = float(closes.tail(25).mean())
+    if len(split_adjusted_closes) >= 25:
+        recent_25 = split_adjusted_closes.tail(25)
+        ma25 = float(recent_25.mean())
 
-        # このCSVではユーザー指定の符号方向を使用する。
-        # 株価が25日線より上ならマイナス、下ならプラス。
+        # 標準的な25日移動平均線乖離率。
+        # 株価が25日線より上ならプラス、下ならマイナス。
         deviation_25ma = safe_div(
-            ma25 - latest_price,
+            latest_price - ma25,
             ma25,
             100.0,
+        )
+
+        position = (
+            "above"
+            if latest_price > ma25
+            else "below"
+            if latest_price < ma25
+            else "equal"
         )
 
         print(
             f"[DEBUG-25MA] {code} close={output_value(latest_price)} "
             f"ma25={output_value(ma25)} "
             f"deviation={output_value(deviation_25ma)} "
-            f"convention=(ma25-close)/ma25",
+            f"position={position} "
+            f"formula=(close-ma25)/ma25 "
+            f"split_events={split_events or 'none'}",
             flush=True,
         )
 
@@ -1438,7 +1494,7 @@ def write_metrics_atomically(rows: list[list[Any]]) -> None:
 
 
 def main() -> int:
-    print("[START] YAHOO_FREE_R9_20260725", flush=True)
+    print("[START] YAHOO_FREE_R10_20260725", flush=True)
     try:
         codes = read_codes()
         print(f"[CONFIG] script_version={SCRIPT_VERSION}", flush=True)
