@@ -1,14 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-Japanese stock metrics collector
+日本株指標収集スクリプト（無料データ版）
 
-Primary source:
-  - J-Quants API V2 (price, volume, financial summary)
-Fallback source:
-  - IRBANK CSV files (financial metrics / operating-profit YoY)
+取得元
+- 当日株価・出来高・25日線: Yahoo Finance（yfinance）
+- 財務指標: IRBANKの配布CSVのみ
+- 信用倍率: JPX「銘柄別信用取引週末残高」の最新公開ファイル
 
-This version intentionally does NOT scrape Kabutan or IRBANK HTML pages.
-Those pages can reject GitHub Actions requests with HTTP 403/405.
+旧版との互換性
+- tickers.txt を読み込む
+- OFFSET / MAX_TICKERS による分割実行に対応
+- metrics.csv の列名と並びを維持
+- 最新営業日の日足が取れない場合は metrics.csv を更新しない
 """
 
 from __future__ import annotations
@@ -19,15 +22,32 @@ import math
 import os
 import re
 import sys
+import tempfile
 import time
 import unicodedata
-from datetime import date, timedelta
+import zipfile
+from datetime import date, datetime, time as dt_time, timedelta
+from pathlib import Path
 from typing import Any
+from urllib.parse import urljoin
+from zoneinfo import ZoneInfo
 
+import exchange_calendars as xcals
 import pandas as pd
 import requests
-import jquantsapi
+import yfinance as yf
+from bs4 import BeautifulSoup
 
+
+# ====== 設定 ======
+IR_CSV = "https://f.irbank.net/files/{code}/{path}"
+JPX_MARGIN_PAGE = "https://www.jpx.co.jp/markets/statistics-equities/margin/05.html"
+
+CSV_PL = "fy-profit-and-loss.csv"
+CSV_BS = "fy-balance-sheet.csv"
+CSV_DIV = "fy-stock-dividend.csv"
+CSV_QQ = "qq-yoy-operating-income.csv"
+CSV_PS = "fy-per-share.csv"
 
 OUTPUT_COLUMNS = [
     "code",
@@ -44,32 +64,35 @@ OUTPUT_COLUMNS = [
     "deviation_25ma_pct",
 ]
 
-IR_CSV_URL = "https://f.irbank.net/files/{code}/{path}"
-IR_FILES = {
-    "pl": "fy-profit-and-loss.csv",
-    "bs": "fy-balance-sheet.csv",
-    "div": "fy-stock-dividend.csv",
-    "qq_op_yoy": "qq-yoy-operating-income.csv",
-}
-
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "25"))
-LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS", "180"))
-SLEEP_SECONDS = float(os.getenv("JQUANTS_SLEEP_SECONDS", "1.0"))
-ENABLE_MARGIN = os.getenv("ENABLE_JQUANTS_MARGIN", "0").strip() == "1"
+JST = ZoneInfo("Asia/Tokyo")
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
+YAHOO_PERIOD = os.getenv("YAHOO_PERIOD", "6mo")
+YAHOO_CHUNK_SIZE = max(1, int(os.getenv("YAHOO_CHUNK_SIZE", "40")))
+YAHOO_RETRIES = max(1, int(os.getenv("YAHOO_RETRIES", "3")))
+IRBANK_RETRIES = max(1, int(os.getenv("IRBANK_RETRIES", "3")))
+MARKET_DATA_READY_TIME = os.getenv("MARKET_DATA_READY_TIME", "16:15")
+STRICT_JPX = os.getenv("STRICT_JPX", "0").strip() == "1"
+JPX_MARGIN_URL_OVERRIDE = os.getenv("JPX_MARGIN_URL", "").strip()
 
 SESSION = requests.Session()
 SESSION.headers.update(
     {
-        "User-Agent": "jp-stocks-automation/2.0",
-        "Accept": "text/csv,application/octet-stream;q=0.9,*/*;q=0.8",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/136.0 Safari/537.36"
+        ),
         "Accept-Language": "ja,en-US;q=0.8,en;q=0.6",
+        "Cache-Control": "no-cache",
     }
 )
 
 
-# ---------------------------------------------------------------------------
-# Generic helpers
-# ---------------------------------------------------------------------------
+# ====== 共通ヘルパー ======
+def polite_sleep(seconds: float) -> None:
+    if seconds > 0:
+        time.sleep(seconds)
+
 
 def normalize_code_line(line: str) -> str:
     token = re.split(r"[\s,\t]+", line.strip())[0] if line else ""
@@ -77,25 +100,26 @@ def normalize_code_line(line: str) -> str:
     return re.sub(r"[^0-9A-Za-z]", "", token).upper()
 
 
-def is_numeric4(code: str) -> bool:
-    return bool(re.fullmatch(r"\d{4}", code))
+def yahoo_symbol(code: str) -> str:
+    return f"{code}.T"
 
 
-def to_float(value: Any) -> float | None:
+def safe_float(value: Any) -> float | None:
     if value is None:
         return None
 
     try:
         if pd.isna(value):
             return None
-    except Exception:
+    except (TypeError, ValueError):
         pass
 
-    text = str(value).replace(",", "").strip()
-    if text in {"", "-", "－", "—", "–", "―", "None", "null", "nan", "NaN"}:
+    text = unicodedata.normalize("NFKC", str(value))
+    text = text.replace(",", "").strip()
+    text = re.sub(r"[％%円¥倍株]", "", text)
+    if text in {"", "-", "--", "---", "None", "null", "nan", "NaN"}:
         return None
 
-    text = re.sub(r"[％%円¥倍株]", "", text).strip()
     try:
         number = float(text)
     except (TypeError, ValueError):
@@ -104,29 +128,16 @@ def to_float(value: Any) -> float | None:
     return number if math.isfinite(number) else None
 
 
-def safe_ratio(numerator: Any, denominator: Any, multiplier: float = 1.0) -> float | None:
-    n = to_float(numerator)
-    d = to_float(denominator)
+def safe_div(numerator: Any, denominator: Any, multiplier: float = 1.0) -> float | None:
+    n = safe_float(numerator)
+    d = safe_float(denominator)
     if n is None or d in (None, 0):
         return None
     return n / d * multiplier
 
 
-def normalize_percentage(value: Any) -> float | None:
-    """
-    J-Quants ratio fields may be represented as either a decimal ratio
-    or a percentage depending on the field/version. Normalize to percent.
-    """
-    number = to_float(value)
-    if number is None:
-        return None
-    if -1.5 <= number <= 1.5:
-        number *= 100.0
-    return number
-
-
 def output_value(value: Any, digits: int = 4) -> str | int | float:
-    number = to_float(value)
+    number = safe_float(value)
     if number is None:
         return ""
     rounded = round(number, digits)
@@ -135,321 +146,212 @@ def output_value(value: Any, digits: int = 4) -> str | int | float:
     return rounded
 
 
-def latest_numeric(df: pd.DataFrame, column: str, *, positive: bool = False) -> float | None:
-    if df.empty or column not in df.columns:
-        return None
-
-    for value in reversed(df[column].tolist()):
-        number = to_float(value)
-        if number is None:
-            continue
-        if positive and number <= 0:
-            continue
-        return number
-    return None
+def parse_ready_time(value: str) -> dt_time:
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})", value.strip())
+    if not match:
+        raise ValueError("MARKET_DATA_READY_TIME must be HH:MM, e.g. 16:15")
+    hour, minute = int(match.group(1)), int(match.group(2))
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        raise ValueError("MARKET_DATA_READY_TIME is outside the valid clock range")
+    return dt_time(hour=hour, minute=minute)
 
 
-def sort_financials(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df.copy()
+# ====== 東証営業日の判定 ======
+def expected_market_date(now_jst: datetime | None = None) -> date:
+    """
+    本日が東証営業日の場合は、引け後の反映待ち時刻を過ぎてから本日を返す。
+    土日祝日は、直近の東証営業日を返す。
+    """
+    now_jst = now_jst or datetime.now(JST)
+    today = now_jst.date()
+    ready_time = parse_ready_time(MARKET_DATA_READY_TIME)
 
-    result = df.copy()
-    for column in ("DiscDate", "CurPerEn", "CurFYEn"):
-        if column in result.columns:
-            result[column] = pd.to_datetime(result[column], errors="coerce")
+    calendar = xcals.get_calendar("XTKS")
+    start = pd.Timestamp(today - timedelta(days=30))
+    end = pd.Timestamp(today)
+    sessions = calendar.sessions_in_range(start, end)
+    session_dates = {pd.Timestamp(session).date() for session in sessions}
 
-    sort_columns = [
-        column
-        for column in ("DiscDate", "DiscTime", "CurPerEn")
-        if column in result.columns
-    ]
-    if sort_columns:
-        result = result.sort_values(sort_columns, na_position="first")
-    return result.reset_index(drop=True)
+    if today in session_dates:
+        if now_jst.time().replace(tzinfo=None) < ready_time:
+            raise RuntimeError(
+                f"本日の東証日足が確定する前です。"
+                f"{today.isoformat()} {ready_time.strftime('%H:%M')} JST以降に実行してください。"
+            )
+        return today
+
+    past_sessions = [session_date for session_date in session_dates if session_date <= today]
+    if not past_sessions:
+        raise RuntimeError("直近の東証営業日を判定できませんでした")
+    return max(past_sessions)
 
 
-# ---------------------------------------------------------------------------
-# J-Quants V2
-# ---------------------------------------------------------------------------
+# ====== Yahoo Finance（日足・出来高） ======
+def _extract_symbol_frame(downloaded: pd.DataFrame, symbol: str) -> pd.DataFrame:
+    if downloaded is None or downloaded.empty:
+        return pd.DataFrame()
 
-def create_jquants_client() -> jquantsapi.ClientV2:
-    api_key = os.getenv("JQUANTS_API_KEY", "").strip()
-    if not api_key:
+    frame: pd.DataFrame
+    if isinstance(downloaded.columns, pd.MultiIndex):
+        level0 = {str(value) for value in downloaded.columns.get_level_values(0)}
+        level1 = {str(value) for value in downloaded.columns.get_level_values(1)}
+
+        if symbol in level0:
+            frame = downloaded[symbol].copy()
+        elif symbol in level1:
+            frame = downloaded.xs(symbol, axis=1, level=1).copy()
+        else:
+            return pd.DataFrame()
+    else:
+        frame = downloaded.copy()
+
+    if frame.empty:
+        return frame
+
+    frame = frame.dropna(how="all")
+    frame.index = pd.to_datetime(frame.index, errors="coerce")
+    frame = frame[frame.index.notna()].sort_index()
+    return frame
+
+
+def download_yahoo_chunk(symbols: list[str]) -> dict[str, pd.DataFrame]:
+    last_error: Exception | None = None
+
+    for attempt in range(1, YAHOO_RETRIES + 1):
+        try:
+            downloaded = yf.download(
+                tickers=symbols,
+                period=YAHOO_PERIOD,
+                interval="1d",
+                group_by="ticker",
+                auto_adjust=False,
+                actions=False,
+                threads=False,
+                repair=True,
+                keepna=False,
+                progress=False,
+                timeout=REQUEST_TIMEOUT,
+                multi_level_index=True,
+            )
+
+            result = {
+                symbol: _extract_symbol_frame(downloaded, symbol)
+                for symbol in symbols
+            }
+            if any(not frame.empty for frame in result.values()):
+                return result
+            raise RuntimeError("Yahoo Finance returned no usable rows")
+
+        except Exception as exc:  # yfinance側の例外型変更にも耐える
+            last_error = exc
+            print(
+                f"[WARN] Yahoo download attempt {attempt}/{YAHOO_RETRIES}: "
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            polite_sleep(2.0 * attempt)
+
+    raise RuntimeError(f"Yahoo Finance download failed: {last_error}")
+
+
+def download_yahoo_all(codes: list[str]) -> dict[str, pd.DataFrame]:
+    frames: dict[str, pd.DataFrame] = {}
+    symbols = [yahoo_symbol(code) for code in codes]
+
+    for start in range(0, len(symbols), YAHOO_CHUNK_SIZE):
+        chunk = symbols[start : start + YAHOO_CHUNK_SIZE]
+        frames.update(download_yahoo_chunk(chunk))
+        if start + YAHOO_CHUNK_SIZE < len(symbols):
+            polite_sleep(1.5)
+
+    return frames
+
+
+def yahoo_metrics(
+    code: str,
+    frame: pd.DataFrame,
+    expected_date: date,
+) -> dict[str, Any]:
+    if frame.empty:
+        raise RuntimeError(f"{code}: Yahoo Financeの日足が0件です")
+    if "Close" not in frame.columns or "Volume" not in frame.columns:
         raise RuntimeError(
-            "JQUANTS_API_KEY is not set. "
-            "Add it to GitHub Actions repository secrets and expose it to this step."
+            f"{code}: Yahoo Financeの必要列がありません: {list(frame.columns)}"
         )
-    return jquantsapi.ClientV2(api_key=api_key)
 
+    work = frame.copy()
+    work["Close"] = pd.to_numeric(work["Close"], errors="coerce")
+    work["Volume"] = pd.to_numeric(work["Volume"], errors="coerce")
+    work = work[work["Close"].notna() & (work["Close"] > 0)].copy()
+    if work.empty:
+        raise RuntimeError(f"{code}: Yahoo Financeに有効な終値がありません")
 
-def fetch_jquants_bars(client: jquantsapi.ClientV2, code: str) -> pd.DataFrame:
-    start = (date.today() - timedelta(days=LOOKBACK_DAYS)).strftime("%Y%m%d")
-    end = date.today().strftime("%Y%m%d")
+    latest_timestamp = pd.Timestamp(work.index.max())
+    if latest_timestamp.tzinfo is not None:
+        latest_timestamp = latest_timestamp.tz_convert(JST).tz_localize(None)
+    latest_date = latest_timestamp.date()
 
-    df = client.get_eq_bars_daily(
-        code=code,
-        from_yyyymmdd=start,
-        to_yyyymmdd=end,
-    )
-    if df is None or df.empty:
-        raise RuntimeError("J-Quants returned no daily price rows")
+    if latest_date != expected_date:
+        raise RuntimeError(
+            f"{code}: stale Yahoo data "
+            f"expected={expected_date.isoformat()} received={latest_date.isoformat()}"
+        )
 
-    result = df.copy()
-    if "Date" in result.columns:
-        result["Date"] = pd.to_datetime(result["Date"], errors="coerce")
-        result = result.sort_values("Date")
+    closes = work["Close"]
+    volumes = work["Volume"].fillna(0)
+    latest_price = float(closes.iloc[-1])
 
-    close_column = "AdjC" if "AdjC" in result.columns else "C"
-    volume_column = "AdjVo" if "AdjVo" in result.columns else "Vo"
+    vol5 = int(round(float(volumes.tail(5).mean()))) if len(volumes) >= 5 else None
+    vol25 = int(round(float(volumes.tail(25).mean()))) if len(volumes) >= 25 else None
+    volume_ratio = safe_div(vol5, vol25)
 
-    if close_column not in result.columns:
-        raise RuntimeError("J-Quants daily bars have no close-price column")
-    if volume_column not in result.columns:
-        raise RuntimeError("J-Quants daily bars have no volume column")
-
-    result["_close"] = pd.to_numeric(result[close_column], errors="coerce")
-    result["_volume"] = pd.to_numeric(result[volume_column], errors="coerce")
-    result = result[result["_close"] > 0].copy()
-
-    if result.empty:
-        raise RuntimeError("J-Quants daily bars contain no valid close prices")
-
-    return result.reset_index(drop=True)
-
-
-def calculate_price_metrics(bars: pd.DataFrame) -> dict[str, float | int | None]:
-    closes = bars["_close"].dropna()
-    volumes = bars["_volume"].fillna(0)
-
-    latest_price = to_float(closes.iloc[-1]) if not closes.empty else None
-
-    vol5 = None
-    vol25 = None
-    volume_ratio = None
     deviation_25ma = None
-
-    if len(volumes) >= 5:
-        vol5 = float(volumes.tail(5).mean())
-
-    if len(volumes) >= 25:
-        vol25 = float(volumes.tail(25).mean())
-
-    if vol5 is not None and vol25 not in (None, 0):
-        volume_ratio = vol5 / vol25
-
     if len(closes) >= 25:
-        latest_25 = closes.tail(25)
-        ma25 = float(latest_25.mean())
-        if ma25 > 0 and latest_price is not None:
-            deviation_25ma = (latest_price / ma25 - 1.0) * 100.0
+        ma25 = float(closes.tail(25).mean())
+        deviation_25ma = safe_div(latest_price - ma25, ma25, 100.0)
 
     return {
+        "latest_date": latest_date,
         "latest_price": latest_price,
-        "vol5": int(round(vol5)) if vol5 is not None else None,
-        "vol25": int(round(vol25)) if vol25 is not None else None,
+        "vol5": vol5,
+        "vol25": vol25,
         "volratio_5_25": volume_ratio,
         "deviation_25ma_pct": deviation_25ma,
     }
 
 
-def fetch_jquants_financials(
-    client: jquantsapi.ClientV2,
-    code: str,
-) -> pd.DataFrame:
-    # The cursor method avoids the deprecation warning on get_fin_summary().
-    df, _ = client.get_fin_summary_cursor(code=code)
-    if df is None:
-        return pd.DataFrame()
-    return sort_financials(df)
-
-
-def latest_fy_row(df: pd.DataFrame) -> pd.Series | None:
-    if df.empty:
-        return None
-
-    if "CurPerType" in df.columns:
-        types = df["CurPerType"].astype(str).str.upper()
-        fy = df[types.isin({"FY", "4Q", "ANNUAL"})]
-        if not fy.empty:
-            return fy.iloc[-1]
-
-    return df.iloc[-1]
-
-
-def calculate_jquants_op_yoy(df: pd.DataFrame) -> float | None:
-    """
-    Compare the latest operating profit with the previous disclosure
-    for the same period type (1Q/2Q/3Q/FY).
-    """
-    if df.empty or "OP" not in df.columns:
-        return None
-
-    work = df.copy()
-    work["_op"] = pd.to_numeric(work["OP"], errors="coerce")
-    work = work[work["_op"].notna()].copy()
-    if work.empty:
-        return None
-
-    if "CurPerEn" in work.columns:
-        work["_period_end"] = pd.to_datetime(work["CurPerEn"], errors="coerce")
-    else:
-        work["_period_end"] = pd.NaT
-
-    if "DiscDate" in work.columns:
-        work["_disc_date"] = pd.to_datetime(work["DiscDate"], errors="coerce")
-    else:
-        work["_disc_date"] = pd.NaT
-
-    work = work.sort_values(["_period_end", "_disc_date"])
-
-    # Keep the latest revision for each accounting period.
-    if work["_period_end"].notna().any():
-        work = work.drop_duplicates(subset=["_period_end"], keep="last")
-
-    latest = work.iloc[-1]
-    period_type = str(latest.get("CurPerType", "")).upper()
-
-    if period_type and "CurPerType" in work.columns:
-        same_type = work[work["CurPerType"].astype(str).str.upper() == period_type]
-    else:
-        same_type = work
-
-    if len(same_type) < 2:
-        return None
-
-    current = to_float(same_type.iloc[-1]["_op"])
-    previous = to_float(same_type.iloc[-2]["_op"])
-    if current is None or previous in (None, 0):
-        return None
-
-    return (current / previous - 1.0) * 100.0
-
-
-def calculate_jquants_financial_metrics(
-    df: pd.DataFrame,
-    latest_price: float | None,
-) -> dict[str, float | None]:
-    if df.empty:
-        return {
-            "per": None,
-            "pbr": None,
-            "roe_pct": None,
-            "equity_ratio_pct": None,
-            "dividend_yield_pct": None,
-            "op_income_yoy_pct": None,
-        }
-
-    latest = df.iloc[-1]
-    fy_row = latest_fy_row(df)
-
-    # Forecast EPS is used first because market PER is normally forward-looking.
-    forecast_eps = latest_numeric(df, "FEPS", positive=True)
-    actual_eps = None
-    if fy_row is not None:
-        actual_eps = to_float(fy_row.get("EPS"))
-    if actual_eps is None:
-        actual_eps = latest_numeric(df, "EPS", positive=True)
-
-    eps_for_per = forecast_eps if forecast_eps is not None else actual_eps
-    bps = latest_numeric(df, "BPS", positive=True)
-
-    per = safe_ratio(latest_price, eps_for_per)
-    pbr = safe_ratio(latest_price, bps)
-
-    roe = None
-    if fy_row is not None:
-        profit = to_float(fy_row.get("NP"))
-        equity = to_float(fy_row.get("Eq"))
-        roe = safe_ratio(profit, equity, 100.0)
-
-        if roe is None:
-            fy_eps = to_float(fy_row.get("EPS"))
-            fy_bps = to_float(fy_row.get("BPS"))
-            roe = safe_ratio(fy_eps, fy_bps, 100.0)
-
-    equity_ratio = normalize_percentage(latest_numeric(df, "EqAR"))
-
-    forecast_dividend = latest_numeric(df, "FDivAnn")
-    actual_dividend = latest_numeric(df, "DivAnn")
-    dividend = (
-        forecast_dividend
-        if forecast_dividend is not None
-        else actual_dividend
-    )
-    dividend_yield = safe_ratio(dividend, latest_price, 100.0)
-
-    return {
-        "per": per,
-        "pbr": pbr,
-        "roe_pct": roe,
-        "equity_ratio_pct": equity_ratio,
-        "dividend_yield_pct": dividend_yield,
-        "op_income_yoy_pct": calculate_jquants_op_yoy(df),
-    }
-
-
-def fetch_credit_ratio(
-    client: jquantsapi.ClientV2,
-    code: str,
-) -> float | None:
-    """
-    Optional. J-Quants margin-interest data requires Standard plan or higher.
-    Enable with ENABLE_JQUANTS_MARGIN=1.
-    """
-    if not ENABLE_MARGIN:
-        return None
-
-    start = (date.today() - timedelta(days=60)).strftime("%Y%m%d")
-    end = date.today().strftime("%Y%m%d")
-
-    try:
-        df = client.get_mkt_margin_interest(
-            code=code,
-            from_yyyymmdd=start,
-            to_yyyymmdd=end,
-        )
-    except Exception as exc:
-        print(f"[WARN] {code} margin data unavailable: {exc}", flush=True)
-        return None
-
-    if df is None or df.empty:
-        return None
-
-    result = df.copy()
-    if "Date" in result.columns:
-        result["Date"] = pd.to_datetime(result["Date"], errors="coerce")
-        result = result.sort_values("Date")
-
-    latest = result.iloc[-1]
-    # Credit ratio = outstanding margin purchases / outstanding margin sales.
-    return safe_ratio(latest.get("LongVol"), latest.get("ShrtVol"))
-
-
-# ---------------------------------------------------------------------------
-# IRBANK CSV fallback
-# ---------------------------------------------------------------------------
-
-def normalize_label(value: Any) -> str:
-    text = "" if value is None else str(value)
+# ====== IRBANK CSV（HTMLは使用しない） ======
+def _norm_label(value: Any) -> str:
+    text = "" if value is None else unicodedata.normalize("NFKC", str(value))
     text = re.sub(r"（.*?）|\(.*?\)", "", text)
     return re.sub(r"[\s　,/％%円¥\-–—―]", "", text)
 
 
 EPS_KEYS = [
     "EPS",
+    "EPS(円)",
+    "EPS（円）",
     "1株当たり利益",
     "1株当たり当期純利益",
+    "1株当たり当期純利益(円)",
+    "1株当たり当期純利益（円）",
     "1株当たり純利益",
 ]
 BPS_KEYS = [
     "BPS",
+    "BPS(円)",
+    "BPS（円）",
     "1株当たり純資産",
+    "1株当たり純資産(円)",
+    "1株当たり純資産（円）",
     "1株純資産",
 ]
 DPS_KEYS = [
     "1株配当",
     "1株配当金",
     "配当金",
+    "配当(円)",
+    "配当（円）",
     "1株当たり配当金",
 ]
 EQ_KEYS = [
@@ -461,57 +363,19 @@ EQ_KEYS = [
     "純資産合計",
     "純資産の部合計",
 ]
-ASSET_KEYS = [
-    "総資産",
-    "資産合計",
-    "資産総額",
-    "資産の部合計",
-]
-PROFIT_KEYS = [
-    "当期純利益",
-    "親会社株主に帰属する当期純利益",
-    "純利益",
-]
-
-
-def get_irbank_csv(code: str, filename: str) -> list[list[str]] | None:
-    if not is_numeric4(code):
-        return None
-
-    url = IR_CSV_URL.format(code=code, path=filename)
-    try:
-        response = SESSION.get(url, timeout=REQUEST_TIMEOUT)
-    except requests.RequestException as exc:
-        print(f"[WARN] {code} IRBANK CSV request failed: {filename}: {exc}", flush=True)
-        return None
-
-    if response.status_code == 404:
-        return None
-    if response.status_code != 200:
-        print(
-            f"[WARN] {code} IRBANK CSV HTTP {response.status_code}: {filename}",
-            flush=True,
-        )
-        return None
-
-    try:
-        rows = list(csv.reader(io.StringIO(response.text)))
-    except csv.Error as exc:
-        print(f"[WARN] {code} invalid IRBANK CSV {filename}: {exc}", flush=True)
-        return None
-
-    return rows if len(rows) >= 2 else None
+AS_KEYS = ["総資産", "資産合計", "資産総額", "資産の部合計"]
+NI_KEYS = ["当期純利益", "親会社株主に帰属する当期純利益", "純利益"]
 
 
 def row_index_by_keys(rows: list[list[str]] | None, keys: list[str]) -> int | None:
     if not rows:
         return None
 
-    normalized_keys = [normalize_label(key) for key in keys]
+    normalized_keys = [_norm_label(key) for key in keys]
     for index, row in enumerate(rows):
         if not row:
             continue
-        heading = normalize_label(row[0])
+        heading = _norm_label(row[0])
         if not heading:
             continue
         if any(key and (key in heading or heading in key) for key in normalized_keys):
@@ -519,7 +383,7 @@ def row_index_by_keys(rows: list[list[str]] | None, keys: list[str]) -> int | No
     return None
 
 
-def last_number_in_row(
+def last_num_in_row(
     rows: list[list[str]] | None,
     row_index: int | None,
 ) -> float | None:
@@ -527,108 +391,292 @@ def last_number_in_row(
         return None
 
     for value in reversed(rows[row_index][1:]):
-        number = to_float(value)
+        number = safe_float(value)
         if number is not None:
             return number
     return None
 
 
-def irbank_operating_profit_yoy(rows: list[list[str]] | None) -> float | None:
+def get_csv(code: str, path: str) -> list[list[str]] | None:
+    """数字4桁・英数字コードの両方を試す。404は欠損として扱う。"""
+    url = IR_CSV.format(code=code, path=path)
+
+    for attempt in range(1, IRBANK_RETRIES + 1):
+        try:
+            response = SESSION.get(url, timeout=REQUEST_TIMEOUT)
+            if response.status_code == 404:
+                print(f"[MISS] {url} -> HTTP 404", flush=True)
+                return None
+            if response.status_code != 200:
+                print(
+                    f"[WARN] {url} -> HTTP {response.status_code} "
+                    f"attempt={attempt}/{IRBANK_RETRIES}",
+                    flush=True,
+                )
+            else:
+                response.encoding = response.apparent_encoding or "utf-8"
+                rows = list(csv.reader(io.StringIO(response.text)))
+                if len(rows) >= 2:
+                    print(f"[OK] {url} rows={len(rows)}", flush=True)
+                    return rows
+                print(f"[WARN] {url} -> CSV too short", flush=True)
+        except requests.RequestException as exc:
+            print(
+                f"[WARN] {url} -> {type(exc).__name__}: {exc} "
+                f"attempt={attempt}/{IRBANK_RETRIES}",
+                flush=True,
+            )
+
+        polite_sleep(1.5 * attempt)
+
+    print(f"[FAIL] {url}", flush=True)
+    return None
+
+
+def fetch_eps_bps_profit_equity_assets_dps(
+    code: str,
+) -> tuple[float | None, float | None, float | None, float | None, float | None, float | None]:
+    pl = get_csv(code, CSV_PL)
+    bs = get_csv(code, CSV_BS)
+    dividend = get_csv(code, CSV_DIV)
+    per_share = get_csv(code, CSV_PS)
+
+    eps = last_num_in_row(pl, row_index_by_keys(pl, EPS_KEYS))
+    profit = last_num_in_row(pl, row_index_by_keys(pl, NI_KEYS))
+    if eps is None:
+        eps = last_num_in_row(per_share, row_index_by_keys(per_share, EPS_KEYS))
+
+    bps = last_num_in_row(bs, row_index_by_keys(bs, BPS_KEYS))
+    equity = last_num_in_row(bs, row_index_by_keys(bs, EQ_KEYS))
+    assets = last_num_in_row(bs, row_index_by_keys(bs, AS_KEYS))
+    if bps is None:
+        bps = last_num_in_row(per_share, row_index_by_keys(per_share, BPS_KEYS))
+
+    dps = last_num_in_row(dividend, row_index_by_keys(dividend, DPS_KEYS))
+    if dps is None:
+        dps = last_num_in_row(per_share, row_index_by_keys(per_share, DPS_KEYS))
+
+    return eps, bps, profit, equity, assets, dps
+
+
+def fetch_opinc_yoy(code: str) -> float | None:
+    rows = get_csv(code, CSV_QQ)
     if not rows:
         return None
 
+    # 旧コードとの互換を優先し、最新行の2列目から先にある最初の数値を返す。
     for row in reversed(rows[1:]):
-        # IRBANK's qq-yoy file normally stores the YoY value in column 2.
-        candidates = row[1:] if len(row) > 1 else row
-        for value in candidates:
-            number = to_float(value)
+        for value in row[1:]:
+            number = safe_float(value)
             if number is not None:
                 return number
     return None
 
 
-def fetch_irbank_fallback(code: str) -> dict[str, float | None]:
-    if not is_numeric4(code):
-        return {}
-
-    pl = get_irbank_csv(code, IR_FILES["pl"])
-    bs = get_irbank_csv(code, IR_FILES["bs"])
-    div = get_irbank_csv(code, IR_FILES["div"])
-    qq = get_irbank_csv(code, IR_FILES["qq_op_yoy"])
-
-    eps = last_number_in_row(pl, row_index_by_keys(pl, EPS_KEYS))
-    profit = last_number_in_row(pl, row_index_by_keys(pl, PROFIT_KEYS))
-
-    bps = last_number_in_row(bs, row_index_by_keys(bs, BPS_KEYS))
-    equity = last_number_in_row(bs, row_index_by_keys(bs, EQ_KEYS))
-    assets = last_number_in_row(bs, row_index_by_keys(bs, ASSET_KEYS))
-
-    dividend = last_number_in_row(div, row_index_by_keys(div, DPS_KEYS))
-
-    return {
-        "eps": eps,
-        "bps": bps,
-        "profit": profit,
-        "equity": equity,
-        "assets": assets,
-        "dividend": dividend,
-        "op_income_yoy_pct": irbank_operating_profit_yoy(qq),
-    }
+# ====== JPX週次信用残高 ======
+def _parse_date_score(text: str) -> int:
+    normalized = unicodedata.normalize("NFKC", text)
+    patterns = [
+        r"(20\d{2})[年/_\-.]?(\d{1,2})[月/_\-.]?(\d{1,2})",
+        r"(20\d{2})(\d{2})(\d{2})",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, normalized)
+        if match:
+            try:
+                return int(date(int(match.group(1)), int(match.group(2)), int(match.group(3))).strftime("%Y%m%d"))
+            except ValueError:
+                pass
+    return 0
 
 
-def merge_irbank_fallback(
-    metrics: dict[str, float | None],
-    irbank: dict[str, float | None],
-    latest_price: float | None,
-) -> dict[str, float | None]:
-    result = dict(metrics)
+def discover_jpx_margin_file() -> str:
+    if JPX_MARGIN_URL_OVERRIDE:
+        return JPX_MARGIN_URL_OVERRIDE
 
-    if result.get("per") is None:
-        result["per"] = safe_ratio(latest_price, irbank.get("eps"))
+    response = SESSION.get(JPX_MARGIN_PAGE, timeout=REQUEST_TIMEOUT)
+    response.raise_for_status()
+    soup = BeautifulSoup(response.text, "html.parser")
 
-    if result.get("pbr") is None:
-        result["pbr"] = safe_ratio(latest_price, irbank.get("bps"))
+    candidates: list[tuple[int, int, str]] = []
+    preferred_extensions = {".xlsx": 5, ".xls": 4, ".csv": 3, ".zip": 2}
 
-    if result.get("roe_pct") is None:
-        result["roe_pct"] = safe_ratio(
-            irbank.get("profit"),
-            irbank.get("equity"),
-            100.0,
+    for order, anchor in enumerate(soup.find_all("a", href=True)):
+        href = anchor.get("href", "").strip()
+        absolute_url = urljoin(JPX_MARGIN_PAGE, href)
+        clean_path = absolute_url.split("?", 1)[0].lower()
+        extension = next(
+            (ext for ext in preferred_extensions if clean_path.endswith(ext)),
+            None,
         )
+        if extension is None:
+            continue
 
-    if result.get("equity_ratio_pct") is None:
-        result["equity_ratio_pct"] = safe_ratio(
-            irbank.get("equity"),
-            irbank.get("assets"),
-            100.0,
+        context = " ".join(
+            [
+                anchor.get_text(" ", strip=True),
+                href,
+                anchor.parent.get_text(" ", strip=True) if anchor.parent else "",
+            ]
         )
+        date_score = _parse_date_score(context)
+        candidates.append((date_score, preferred_extensions[extension] * 10000 + order, absolute_url))
 
-    if result.get("dividend_yield_pct") is None:
-        result["dividend_yield_pct"] = safe_ratio(
-            irbank.get("dividend"),
-            latest_price,
-            100.0,
-        )
+    if not candidates:
+        raise RuntimeError("JPXページから信用残高のExcel/CSVリンクを発見できませんでした")
 
-    # IRBANK's dedicated quarterly YoY CSV is preferred when available.
-    if irbank.get("op_income_yoy_pct") is not None:
-        result["op_income_yoy_pct"] = irbank["op_income_yoy_pct"]
-
-    return result
+    candidates.sort()
+    return candidates[-1][2]
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+def _read_jpx_payload(url: str, content: bytes) -> list[pd.DataFrame]:
+    lower_url = url.split("?", 1)[0].lower()
+    frames: list[pd.DataFrame] = []
 
-def read_codes() -> list[str]:
-    with open("tickers.txt", "r", encoding="utf-8") as file:
-        codes = [
-            normalize_code_line(line)
-            for line in file
-            if line.strip()
+    if lower_url.endswith(".csv"):
+        for encoding in ("cp932", "utf-8-sig", "utf-8"):
+            try:
+                frames.append(pd.read_csv(io.BytesIO(content), header=None, encoding=encoding))
+                return frames
+            except Exception:
+                continue
+        raise RuntimeError("JPX CSVを読み込めませんでした")
+
+    if lower_url.endswith(".zip"):
+        with zipfile.ZipFile(io.BytesIO(content)) as archive:
+            for name in archive.namelist():
+                if name.lower().endswith((".xlsx", ".xls")):
+                    payload = archive.read(name)
+                    excel = pd.read_excel(io.BytesIO(payload), sheet_name=None, header=None)
+                    frames.extend(excel.values())
+                elif name.lower().endswith(".csv"):
+                    payload = archive.read(name)
+                    for encoding in ("cp932", "utf-8-sig", "utf-8"):
+                        try:
+                            frames.append(pd.read_csv(io.BytesIO(payload), header=None, encoding=encoding))
+                            break
+                        except Exception:
+                            continue
+        return frames
+
+    excel = pd.read_excel(io.BytesIO(content), sheet_name=None, header=None)
+    frames.extend(excel.values())
+    return frames
+
+
+def _header_text(frame: pd.DataFrame, row: int, column: int) -> str:
+    parts: list[str] = []
+    for offset in range(3, -1, -1):
+        source_row = row - offset
+        if source_row < 0:
+            continue
+        value = frame.iat[source_row, column]
+        if pd.isna(value):
+            continue
+        text = _norm_label(value)
+        if text:
+            parts.append(text)
+    return "".join(parts)
+
+
+def _find_jpx_columns(frame: pd.DataFrame) -> tuple[int, int, int, int] | None:
+    max_header_rows = min(30, len(frame))
+
+    for row in range(max_header_rows):
+        headers = [_header_text(frame, row, col) for col in range(frame.shape[1])]
+
+        code_candidates = [
+            col for col, text in enumerate(headers)
+            if "銘柄コード" in text or text.endswith("コード") or text == "コード"
+        ]
+        short_candidates = [
+            col for col, text in enumerate(headers)
+            if any(key in text for key in ("売残高", "売残", "売り残高", "売り残"))
+        ]
+        long_candidates = [
+            col for col, text in enumerate(headers)
+            if any(key in text for key in ("買残高", "買残", "買い残高", "買い残"))
         ]
 
+        if not code_candidates or not short_candidates or not long_candidates:
+            continue
+
+        def column_score(column: int, side: str) -> tuple[int, int]:
+            text = headers[column]
+            score = 0
+            if "合計" in text or "総" in text:
+                score += 20
+            if side == "short" and text.endswith(("売残高", "売残")):
+                score += 10
+            if side == "long" and text.endswith(("買残高", "買残")):
+                score += 10
+            if "制度" in text or "一般" in text:
+                score -= 5
+            return score, column
+
+        code_col = code_candidates[0]
+        short_col = max(short_candidates, key=lambda col: column_score(col, "short"))
+        long_col = max(long_candidates, key=lambda col: column_score(col, "long"))
+        return row, code_col, short_col, long_col
+
+    return None
+
+
+def _parse_jpx_frame(frame: pd.DataFrame) -> dict[str, float]:
+    columns = _find_jpx_columns(frame)
+    if columns is None:
+        return {}
+
+    header_row, code_col, short_col, long_col = columns
+    ratios: dict[str, float] = {}
+
+    for row in range(header_row + 1, len(frame)):
+        code = normalize_code_line(str(frame.iat[row, code_col]))
+        if not re.fullmatch(r"[0-9A-Z]{4}", code):
+            continue
+
+        short_balance = safe_float(frame.iat[row, short_col])
+        long_balance = safe_float(frame.iat[row, long_col])
+        ratio = safe_div(long_balance, short_balance)
+        if ratio is not None and ratio >= 0:
+            ratios[code] = ratio
+
+    return ratios
+
+
+def fetch_jpx_credit_ratios() -> tuple[dict[str, float], str]:
+    try:
+        url = discover_jpx_margin_file()
+        response = SESSION.get(url, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        frames = _read_jpx_payload(url, response.content)
+
+        best: dict[str, float] = {}
+        for frame in frames:
+            parsed = _parse_jpx_frame(frame)
+            if len(parsed) > len(best):
+                best = parsed
+
+        if not best:
+            raise RuntimeError("JPX信用残高ファイルの列を判定できませんでした")
+
+        print(f"[OK] JPX credit ratios rows={len(best)} url={url}", flush=True)
+        return best, url
+
+    except Exception as exc:
+        message = f"JPX credit ratios unavailable: {type(exc).__name__}: {exc}"
+        if STRICT_JPX:
+            raise RuntimeError(message) from exc
+        print(f"[WARN] {message}", flush=True)
+        return {}, ""
+
+
+# ====== Main ======
+def read_codes() -> list[str]:
+    with open("tickers.txt", "r", encoding="utf-8") as file:
+        raw = [line for line in file if line.strip()]
+
+    codes = [normalize_code_line(line) for line in raw]
     codes = [code for code in codes if code]
     codes = list(dict.fromkeys(codes))
 
@@ -641,133 +689,140 @@ def read_codes() -> list[str]:
     return codes
 
 
-def blank_row(code: str) -> dict[str, Any]:
-    row = {column: "" for column in OUTPUT_COLUMNS}
-    row["code"] = code
-    return row
-
-
-def collect_one(
-    client: jquantsapi.ClientV2,
+def build_row(
     code: str,
-) -> dict[str, Any]:
-    bars = fetch_jquants_bars(client, code)
-    price_metrics = calculate_price_metrics(bars)
-    latest_price = to_float(price_metrics["latest_price"])
+    market: dict[str, Any],
+    credit_ratios: dict[str, float],
+) -> list[Any]:
+    latest_price = market["latest_price"]
+    eps, bps, profit, equity, assets, dps = fetch_eps_bps_profit_equity_assets_dps(code)
 
-    financial_df = fetch_jquants_financials(client, code)
-    financial_metrics = calculate_jquants_financial_metrics(
-        financial_df,
-        latest_price,
-    )
+    per = safe_div(latest_price, eps)
+    pbr = safe_div(latest_price, bps)
+    roe_pct = safe_div(profit, equity, 100.0)
+    equity_ratio_pct = safe_div(equity, assets, 100.0)
+    dividend_yield_pct = safe_div(dps, latest_price, 100.0)
+    op_yoy = fetch_opinc_yoy(code)
+    credit_ratio = credit_ratios.get(code)
 
-    irbank = fetch_irbank_fallback(code)
-    financial_metrics = merge_irbank_fallback(
-        financial_metrics,
-        irbank,
-        latest_price,
-    )
-
-    credit_ratio = fetch_credit_ratio(client, code)
-
-    row = {
-        "code": code,
-        "per": output_value(financial_metrics.get("per")),
-        "pbr": output_value(financial_metrics.get("pbr")),
-        "roe_pct": output_value(financial_metrics.get("roe_pct")),
-        "equity_ratio_pct": output_value(
-            financial_metrics.get("equity_ratio_pct")
-        ),
-        "dividend_yield_pct": output_value(
-            financial_metrics.get("dividend_yield_pct")
-        ),
-        "op_income_yoy_pct": output_value(
-            financial_metrics.get("op_income_yoy_pct")
-        ),
-        "credit_ratio": output_value(credit_ratio),
-        "vol5": output_value(price_metrics.get("vol5"), digits=0),
-        "vol25": output_value(price_metrics.get("vol25"), digits=0),
-        "volratio_5_25": output_value(
-            price_metrics.get("volratio_5_25")
-        ),
-        "deviation_25ma_pct": output_value(
-            price_metrics.get("deviation_25ma_pct")
-        ),
-    }
-
-    latest_date = ""
-    if "Date" in bars.columns and not bars.empty:
-        date_value = bars.iloc[-1]["Date"]
-        if not pd.isna(date_value):
-            latest_date = pd.Timestamp(date_value).strftime("%Y-%m-%d")
-
-    filled = sum(
-        1
-        for key, value in row.items()
-        if key != "code" and value not in ("", None)
-    )
-    print(
-        f"[OK] {code} data_date={latest_date or 'unknown'} "
-        f"filled={filled}/{len(OUTPUT_COLUMNS) - 1} "
-        f"price={output_value(latest_price)}",
-        flush=True,
-    )
-    return row
+    return [
+        code,
+        output_value(per),
+        output_value(pbr),
+        output_value(roe_pct),
+        output_value(equity_ratio_pct),
+        output_value(dividend_yield_pct),
+        output_value(op_yoy),
+        output_value(credit_ratio),
+        output_value(market["vol5"], digits=0),
+        output_value(market["vol25"], digits=0),
+        output_value(market["volratio_5_25"]),
+        output_value(market["deviation_25ma_pct"]),
+    ]
 
 
-def write_metrics(rows: list[dict[str, Any]]) -> None:
-    with open("metrics.csv", "w", newline="", encoding="utf-8") as file:
-        writer = csv.DictWriter(file, fieldnames=OUTPUT_COLUMNS)
-        writer.writeheader()
-        writer.writerows(rows)
-    print("metrics.csv written", flush=True)
+def write_metrics_atomically(rows: list[list[Any]]) -> None:
+    output_path = Path("metrics.csv")
+    output_directory = output_path.parent.resolve()
+
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            newline="",
+            encoding="utf-8",
+            dir=output_directory,
+            prefix="metrics_",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary_file:
+            temporary_path = Path(temporary_file.name)
+            writer = csv.writer(temporary_file)
+            writer.writerow(OUTPUT_COLUMNS)
+            writer.writerows(rows)
+            temporary_file.flush()
+            os.fsync(temporary_file.fileno())
+
+        os.replace(temporary_path, output_path)
+        print("metrics.csv written", flush=True)
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink(missing_ok=True)
 
 
 def main() -> int:
-    codes = read_codes()
-    print(f"Total tickers to process in this shard: {len(codes)}", flush=True)
-    print(
-        f"[CONFIG] JQUANTS_API_KEY exists="
-        f"{bool(os.getenv('JQUANTS_API_KEY', '').strip())} "
-        f"margin_enabled={ENABLE_MARGIN}",
-        flush=True,
-    )
+    try:
+        codes = read_codes()
+        print(f"Total tickers to process in this shard: {len(codes)}", flush=True)
 
-    if not codes:
-        write_metrics([])
+        if not codes:
+            print("[FATAL] tickers.txtに処理対象がありません", flush=True)
+            return 1
+
+        expected_date = expected_market_date()
+        print(
+            f"[CONFIG] source=YahooFinance/IRBANK-CSV/JPX "
+            f"expected_market_date={expected_date.isoformat()} "
+            f"strict_jpx={STRICT_JPX}",
+            flush=True,
+        )
+
+        yahoo_frames = download_yahoo_all(codes)
+
+        # Yahooの日付を全銘柄で先に検証する。
+        # 1件でも古ければ、IRBANK取得やmetrics.csv更新へ進まない。
+        market_metrics: dict[str, dict[str, Any]] = {}
+        validation_errors: list[str] = []
+        for index, code in enumerate(codes, 1):
+            print(f"[{index}/{len(codes)}] {code} Yahoo validation", flush=True)
+            symbol = yahoo_symbol(code)
+            try:
+                market_metrics[code] = yahoo_metrics(
+                    code,
+                    yahoo_frames.get(symbol, pd.DataFrame()),
+                    expected_date,
+                )
+                print(
+                    f"[OK] {code} Yahoo date="
+                    f"{market_metrics[code]['latest_date'].isoformat()} "
+                    f"price={output_value(market_metrics[code]['latest_price'])}",
+                    flush=True,
+                )
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+                validation_errors.append(error)
+                print(f"[ERROR] {error}", flush=True)
+
+        if validation_errors:
+            print(
+                f"[FATAL] Yahoo Financeの最新日付を確認できない銘柄が"
+                f"{len(validation_errors)}件あります。metrics.csvは更新しません。",
+                flush=True,
+            )
+            return 1
+
+        credit_ratios, _ = fetch_jpx_credit_ratios()
+
+        rows: list[list[Any]] = []
+        for index, code in enumerate(codes, 1):
+            print(f"[{index}/{len(codes)}] {code} financial metrics", flush=True)
+            row = build_row(code, market_metrics[code], credit_ratios)
+            rows.append(row)
+            filled = sum(1 for value in row[1:] if value not in ("", None))
+            print(
+                f"[OK] {code} filled={filled}/{len(OUTPUT_COLUMNS) - 1} "
+                f"credit={'yes' if code in credit_ratios else 'no'}",
+                flush=True,
+            )
+            polite_sleep(0.4)
+
+        write_metrics_atomically(rows)
         return 0
 
-    try:
-        client = create_jquants_client()
     except Exception as exc:
-        print(f"[FATAL] {exc}", flush=True)
-        return 2
-
-    rows: list[dict[str, Any]] = []
-    failures = 0
-
-    for index, code in enumerate(codes, 1):
-        print(f"[{index}/{len(codes)}] {code} start", flush=True)
-        try:
-            rows.append(collect_one(client, code))
-        except Exception as exc:
-            failures += 1
-            print(f"[ERROR] {code}: {type(exc).__name__}: {exc}", flush=True)
-            rows.append(blank_row(code))
-
-        if index < len(codes) and SLEEP_SECONDS > 0:
-            time.sleep(SLEEP_SECONDS)
-
-    write_metrics(rows)
-
-    if failures == len(codes):
-        print("[FATAL] Every ticker failed; refusing to report a successful run.", flush=True)
+        print(f"[FATAL] {type(exc).__name__}: {exc}", flush=True)
+        print("metrics.csvは更新していません。", flush=True)
         return 1
-
-    if failures:
-        print(f"[WARN] completed with {failures} failed ticker(s)", flush=True)
-
-    return 0
 
 
 if __name__ == "__main__":
