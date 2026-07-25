@@ -40,7 +40,7 @@ import yfinance as yf
 import pdfplumber
 from bs4 import BeautifulSoup
 
-SCRIPT_VERSION = "YAHOO_FREE_R7_20260725"
+SCRIPT_VERSION = "YAHOO_FREE_R8_20260725"
 
 
 
@@ -959,11 +959,11 @@ def _parse_jpx_pdf_text(content: bytes) -> dict[str, float]:
     ratios: dict[str, float] = {}
 
     line_pattern = re.compile(
-        r"(?P<code>[0-9A-Z]{5})\\s+"
-        r"JP[0-9A-Z]{10}\\s+"
-        r"(?P<short>[\\d,]+)\\s+"
-        r"(?:(?:▲|△|-)\\s*)?[\\d,]+\\s+"
-        r"(?P<long>[\\d,]+)(?:\\s|$)"
+        r"(?P<code>[0-9A-Z]{5})\s+"
+        r"JP[0-9A-Z]{10}\s+"
+        r"(?P<short>[\d,]+)\s+"
+        r"(?:(?:▲|△|-)\s*)?[\d,]+\s+"
+        r"(?P<long>[\d,]+)(?:\s|$)"
     )
 
     with pdfplumber.open(io.BytesIO(content)) as pdf:
@@ -986,6 +986,12 @@ def _parse_jpx_pdf_text(content: bytes) -> dict[str, float]:
 
                 if ratio is not None and ratio >= 0:
                     ratios[code] = ratio
+
+    if "3674" in ratios:
+        print(
+            f"[DEBUG-JPX-3674] credit_ratio={round(ratios['3674'], 4)}",
+            flush=True,
+        )
 
     return ratios
 
@@ -1235,7 +1241,22 @@ def fetch_jpx_credit_ratios() -> tuple[dict[str, float], str]:
                 # 現行JPX週末残高はPDF。表抽出より本文行の方が安定する。
                 if kind == "pdf":
                     parsed_text = _parse_jpx_pdf_text(response.content)
-                    if len(parsed_text) > len(best):
+
+                    if len(parsed_text) >= MIN_JPX_PARSED_ROWS:
+                        print(
+                            f"[OK] JPX credit ratios rows={len(parsed_text)} "
+                            f"source=pdf_text url={url}",
+                            flush=True,
+                        )
+                        return parsed_text, url
+
+                    if parsed_text:
+                        print(
+                            f"[WARN] JPX PDF text parse was too small: "
+                            f"parsed_rows={len(parsed_text)} "
+                            f"minimum={MIN_JPX_PARSED_ROWS} url={url}",
+                            flush=True,
+                        )
                         best = parsed_text
 
                 # Excel/CSV/ZIPおよびPDF表抽出のフォールバック。
@@ -1401,7 +1422,7 @@ def write_metrics_atomically(rows: list[list[Any]]) -> None:
 
 
 def main() -> int:
-    print("[START] YAHOO_FREE_R7_20260725", flush=True)
+    print("[START] YAHOO_FREE_R8_20260725", flush=True)
     try:
         codes = read_codes()
         print(f"[CONFIG] script_version={SCRIPT_VERSION}", flush=True)
