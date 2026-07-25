@@ -40,7 +40,7 @@ import yfinance as yf
 import pdfplumber
 from bs4 import BeautifulSoup
 
-SCRIPT_VERSION = "YAHOO_FREE_R6_20260725"
+SCRIPT_VERSION = "YAHOO_FREE_R7_20260725"
 
 
 
@@ -73,13 +73,14 @@ OUTPUT_COLUMNS = [
 
 JST = ZoneInfo("Asia/Tokyo")
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
-YAHOO_PERIOD = os.getenv("YAHOO_PERIOD", "6mo")
+YAHOO_PERIOD = os.getenv("YAHOO_PERIOD", "2y")
 YAHOO_CHUNK_SIZE = max(1, int(os.getenv("YAHOO_CHUNK_SIZE", "40")))
 YAHOO_RETRIES = max(1, int(os.getenv("YAHOO_RETRIES", "3")))
 IRBANK_RETRIES = max(1, int(os.getenv("IRBANK_RETRIES", "3")))
 MARKET_DATA_READY_TIME = os.getenv("MARKET_DATA_READY_TIME", "16:15")
 STRICT_JPX = os.getenv("STRICT_JPX", "0").strip() == "1"
 JPX_MARGIN_URL_OVERRIDE = os.getenv("JPX_MARGIN_URL", "").strip()
+MIN_JPX_PARSED_ROWS = max(100, int(os.getenv("MIN_JPX_PARSED_ROWS", "100")))
 
 SESSION = requests.Session()
 SESSION.headers.update(
@@ -241,7 +242,7 @@ def download_yahoo_chunk(symbols: list[str]) -> dict[str, pd.DataFrame]:
                 interval="1d",
                 group_by="ticker",
                 auto_adjust=False,
-                actions=False,
+                actions=True,
                 threads=False,
                 # 価格補修機能は追加依存が必要なため無効化。
                 repair=False,
@@ -299,6 +300,11 @@ def yahoo_metrics(
     work = frame.copy()
     work["Close"] = pd.to_numeric(work["Close"], errors="coerce")
     work["Volume"] = pd.to_numeric(work["Volume"], errors="coerce")
+    if "Dividends" in work.columns:
+        work["Dividends"] = pd.to_numeric(
+            work["Dividends"],
+            errors="coerce",
+        ).fillna(0)
     work = work[work["Close"].notna() & (work["Close"] > 0)].copy()
     if work.empty:
         raise RuntimeError(f"{code}: Yahoo Financeに有効な終値がありません")
@@ -327,9 +333,18 @@ def yahoo_metrics(
         ma25 = float(closes.tail(25).mean())
         deviation_25ma = safe_div(latest_price - ma25, ma25, 100.0)
 
+    trailing_dividend = None
+    if "Dividends" in work.columns:
+        cutoff = pd.Timestamp(expected_date - timedelta(days=370))
+        dividend_rows = work.loc[work.index >= cutoff, "Dividends"]
+        trailing_dividend = float(dividend_rows.sum())
+        if abs(trailing_dividend) < 1e-12:
+            trailing_dividend = 0.0
+
     return {
         "latest_date": latest_date,
         "latest_price": latest_price,
+        "trailing_dividend": trailing_dividend,
         "vol5": vol5,
         "vol25": vol25,
         "volratio_5_25": volume_ratio,
@@ -922,6 +937,59 @@ def _payload_kind(url: str, content_type: str, content: bytes) -> str:
     return "unknown"
 
 
+def _normalize_jpx_security_code(value: Any) -> str:
+    """
+    JPX PDFの新証券コードは、普通株式の場合
+    3674 -> 36740、215A -> 215A0 のように末尾0が付く。
+    metrics.csv/tickers.txtの4文字コードへ戻す。
+    """
+    code = normalize_code_line(str(value))
+    if len(code) == 5 and code.endswith("0"):
+        return code[:-1]
+    return code
+
+
+def _parse_jpx_pdf_text(content: bytes) -> dict[str, float]:
+    """
+    JPX週末残高PDFの本文行を直接解析する。
+
+    行の主な並び:
+      銘柄名 36740 JP... 売残高 売前週比 買残高 買前週比 ...
+    """
+    ratios: dict[str, float] = {}
+
+    line_pattern = re.compile(
+        r"(?P<code>[0-9A-Z]{5})\\s+"
+        r"JP[0-9A-Z]{10}\\s+"
+        r"(?P<short>[\\d,]+)\\s+"
+        r"(?:(?:▲|△|-)\\s*)?[\\d,]+\\s+"
+        r"(?P<long>[\\d,]+)(?:\\s|$)"
+    )
+
+    with pdfplumber.open(io.BytesIO(content)) as pdf:
+        for page in pdf.pages:
+            page_text = page.extract_text() or ""
+            page_text = unicodedata.normalize("NFKC", page_text)
+
+            for line in page_text.splitlines():
+                match = line_pattern.search(line)
+                if not match:
+                    continue
+
+                code = _normalize_jpx_security_code(match.group("code"))
+                if not re.fullmatch(r"[0-9A-Z]{4}", code):
+                    continue
+
+                short_balance = safe_float(match.group("short"))
+                long_balance = safe_float(match.group("long"))
+                ratio = safe_div(long_balance, short_balance)
+
+                if ratio is not None and ratio >= 0:
+                    ratios[code] = ratio
+
+    return ratios
+
+
 def _read_pdf_tables(content: bytes) -> list[pd.DataFrame]:
     frames: list[pd.DataFrame] = []
     with pdfplumber.open(io.BytesIO(content)) as pdf:
@@ -1108,7 +1176,7 @@ def _parse_jpx_frame(frame: pd.DataFrame) -> dict[str, float]:
 
     for row in range(header_row + 1, len(frame)):
         raw_code = frame.iat[row, code_col]
-        code = normalize_code_line(str(raw_code))
+        code = _normalize_jpx_security_code(raw_code)
         if not re.fullmatch(r"[0-9A-Z]{4}", code):
             continue
 
@@ -1156,24 +1224,45 @@ def fetch_jpx_credit_ratios() -> tuple[dict[str, float], str]:
                 ):
                     continue
 
-                frames = _read_jpx_payload(
+                kind = _payload_kind(
                     url,
                     content_type,
                     response.content,
                 )
 
                 best: dict[str, float] = {}
+
+                # 現行JPX週末残高はPDF。表抽出より本文行の方が安定する。
+                if kind == "pdf":
+                    parsed_text = _parse_jpx_pdf_text(response.content)
+                    if len(parsed_text) > len(best):
+                        best = parsed_text
+
+                # Excel/CSV/ZIPおよびPDF表抽出のフォールバック。
+                frames = _read_jpx_payload(
+                    url,
+                    content_type,
+                    response.content,
+                )
                 for frame in frames:
                     parsed = _parse_jpx_frame(frame)
                     if len(parsed) > len(best):
                         best = parsed
 
-                if best:
+                if len(best) >= MIN_JPX_PARSED_ROWS:
                     print(
                         f"[OK] JPX credit ratios rows={len(best)} url={url}",
                         flush=True,
                     )
                     return best, url
+
+                if best:
+                    print(
+                        f"[WARN] JPX candidate rejected: "
+                        f"parsed_rows={len(best)} minimum={MIN_JPX_PARSED_ROWS} "
+                        f"url={url}",
+                        flush=True,
+                    )
 
             except Exception as exc:
                 errors.append(
@@ -1239,15 +1328,25 @@ def build_row(
             financial["assets"],
             100.0,
         )
+    dividend_per_share_value = financial["dps"]
+    if dividend_per_share_value is None:
+        dividend_per_share_value = market.get("trailing_dividend")
+        if dividend_per_share_value is not None:
+            print(
+                f"[DEBUG-DIVIDEND] {code} source=yahoo_ttm "
+                f"dps={dividend_per_share_value}",
+                flush=True,
+            )
+
     dividend_yield_pct = safe_div(
-        financial["dps"],
+        dividend_per_share_value,
         latest_price,
         100.0,
     )
     if dividend_yield_pct is not None and not (0 <= dividend_yield_pct <= 30):
         print(
             f"[WARN] {code} rejected abnormal dividend yield: "
-            f"dps={financial['dps']} price={latest_price} "
+            f"dps={dividend_per_share_value} price={latest_price} "
             f"yield={dividend_yield_pct}",
             flush=True,
         )
@@ -1302,7 +1401,7 @@ def write_metrics_atomically(rows: list[list[Any]]) -> None:
 
 
 def main() -> int:
-    print("[START] YAHOO_FREE_R6_20260725", flush=True)
+    print("[START] YAHOO_FREE_R7_20260725", flush=True)
     try:
         codes = read_codes()
         print(f"[CONFIG] script_version={SCRIPT_VERSION}", flush=True)
