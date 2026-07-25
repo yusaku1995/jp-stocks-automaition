@@ -40,7 +40,9 @@ import yfinance as yf
 import pdfplumber
 from bs4 import BeautifulSoup
 
-SCRIPT_VERSION = "YAHOO_FREE_R10_20260725"
+SCRIPT_VERSION = "YAHOO_FREE_R12_20260725"
+DEVIATION_SIGN_RULE = "above_positive_below_negative"
+STRICT_DEVIATION_SIGN = os.getenv("STRICT_DEVIATION_SIGN", "1").strip() != "0"
 
 
 
@@ -375,35 +377,67 @@ def yahoo_metrics(
     volume_ratio = safe_div(vol5, vol25)
 
     deviation_25ma = None
-    if len(split_adjusted_closes) >= 25:
-        recent_25 = split_adjusted_closes.tail(25)
-        ma25 = float(recent_25.mean())
+    if len(raw_closes) >= 25:
+        raw_recent_25 = raw_closes.tail(25)
+        raw_ma25 = float(raw_recent_25.mean())
 
-        # 標準的な25日移動平均線乖離率。
-        # 株価が25日線より上ならプラス、下ならマイナス。
-        deviation_25ma = safe_div(
-            latest_price - ma25,
-            ma25,
-            100.0,
+        recent_start_date = pd.Timestamp(raw_recent_25.index.min()).date()
+        recent_end_date = pd.Timestamp(raw_recent_25.index.max()).date()
+        split_in_window = any(
+            recent_start_date <= date.fromisoformat(split_date) <= recent_end_date
+            for split_date, _ in split_events
         )
 
-        position = (
-            "above"
-            if latest_price > ma25
-            else "below"
-            if latest_price < ma25
-            else "equal"
-        )
+        if split_in_window:
+            used_recent_25 = split_adjusted_closes.tail(25)
+            ma25_source = "split_adjusted_close"
+        else:
+            used_recent_25 = raw_recent_25
+            ma25_source = "raw_close"
+
+        ma25 = float(used_recent_25.mean())
+
+        # 25日移動平均線乖離率の定義を固定する。
+        # 終値が25MAより上ならプラス、下ならマイナス。
+        deviation_25ma = (
+            (latest_price / ma25) - 1.0
+        ) * 100.0
+
+        tolerance = max(1e-10, ma25 * 1e-12)
+        if latest_price > ma25 + tolerance:
+            position = "above"
+            expected_sign = "positive"
+            sign_is_valid = deviation_25ma > 0
+        elif latest_price < ma25 - tolerance:
+            position = "below"
+            expected_sign = "negative"
+            sign_is_valid = deviation_25ma < 0
+        else:
+            position = "equal"
+            expected_sign = "zero"
+            deviation_25ma = 0.0
+            sign_is_valid = True
 
         print(
             f"[DEBUG-25MA] {code} close={output_value(latest_price)} "
-            f"ma25={output_value(ma25)} "
+            f"raw_ma25={output_value(raw_ma25)} "
+            f"used_ma25={output_value(ma25)} "
+            f"source={ma25_source} "
             f"deviation={output_value(deviation_25ma)} "
-            f"position={position} "
-            f"formula=(close-ma25)/ma25 "
+            f"position={position} expected_sign={expected_sign} "
+            f"sign_valid={sign_is_valid} "
+            f"formula=(close/ma25-1)*100 "
             f"split_events={split_events or 'none'}",
             flush=True,
         )
+
+        if STRICT_DEVIATION_SIGN and not sign_is_valid:
+            raise RuntimeError(
+                f"{code}: 25MA乖離率の符号検証に失敗しました "
+                f"close={latest_price} ma25={ma25} "
+                f"deviation={deviation_25ma} "
+                f"position={position} expected={expected_sign}"
+            )
 
     trailing_dividend = None
     if "Dividends" in work.columns:
@@ -1494,10 +1528,15 @@ def write_metrics_atomically(rows: list[list[Any]]) -> None:
 
 
 def main() -> int:
-    print("[START] YAHOO_FREE_R10_20260725", flush=True)
+    print("[START] YAHOO_FREE_R12_20260725", flush=True)
     try:
         codes = read_codes()
         print(f"[CONFIG] script_version={SCRIPT_VERSION}", flush=True)
+        print(
+            f"[CONFIG] deviation_sign_rule={DEVIATION_SIGN_RULE} "
+            f"strict={STRICT_DEVIATION_SIGN}",
+            flush=True,
+        )
         print(f"Total tickers to process in this shard: {len(codes)}", flush=True)
 
         if not codes:
