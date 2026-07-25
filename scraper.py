@@ -40,7 +40,7 @@ import yfinance as yf
 import pdfplumber
 from bs4 import BeautifulSoup
 
-SCRIPT_VERSION = "YAHOO_FREE_R8_20260725"
+SCRIPT_VERSION = "YAHOO_FREE_R9_20260725"
 
 
 
@@ -306,6 +306,7 @@ def yahoo_metrics(
             errors="coerce",
         ).fillna(0)
     work = work[work["Close"].notna() & (work["Close"] > 0)].copy()
+    work = work.sort_index()
     if work.empty:
         raise RuntimeError(f"{code}: Yahoo Financeに有効な終値がありません")
 
@@ -331,7 +332,22 @@ def yahoo_metrics(
     deviation_25ma = None
     if len(closes) >= 25:
         ma25 = float(closes.tail(25).mean())
-        deviation_25ma = safe_div(latest_price - ma25, ma25, 100.0)
+
+        # このCSVではユーザー指定の符号方向を使用する。
+        # 株価が25日線より上ならマイナス、下ならプラス。
+        deviation_25ma = safe_div(
+            ma25 - latest_price,
+            ma25,
+            100.0,
+        )
+
+        print(
+            f"[DEBUG-25MA] {code} close={output_value(latest_price)} "
+            f"ma25={output_value(ma25)} "
+            f"deviation={output_value(deviation_25ma)} "
+            f"convention=(ma25-close)/ma25",
+            flush=True,
+        )
 
     trailing_dividend = None
     if "Dividends" in work.columns:
@@ -1422,7 +1438,7 @@ def write_metrics_atomically(rows: list[list[Any]]) -> None:
 
 
 def main() -> int:
-    print("[START] YAHOO_FREE_R8_20260725", flush=True)
+    print("[START] YAHOO_FREE_R9_20260725", flush=True)
     try:
         codes = read_codes()
         print(f"[CONFIG] script_version={SCRIPT_VERSION}", flush=True)
